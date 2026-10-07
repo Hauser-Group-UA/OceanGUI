@@ -19,7 +19,7 @@ from .units import XUnit, available_units, spectral_axis
 from .view_mode import ViewPage
 from .widgets import (DisplaySettings, FullScreenPlot, SidePanel, SpectrumPlot,
                       TimeField, UncertaintyBox, breakable, describe_outliers,
-                      format_duration, outlier_group, scroll_page)
+                      outlier_group, scroll_page)
 
 HELP_TEXT = """\
 <h2>Ocean Spectrometer GUI - Help</h2>
@@ -55,11 +55,8 @@ disturbing the running one.</p>
 <h3>2. Settings</h3>
 <ul>
 <li><b>Single integration</b> - exposure time of one spectrum. Pick the unit
-    (ms / s / min / h) next to the value. If it is outside what the
-    spectrometer supports (most models allow at most about a minute), you are
-    told the closest time the device can do before the run starts.</li>
-<li><b>Down time</b> - pause inserted between integrations (same units) -
-    e.g. 1 h for one spectrum per hour.</li>
+    (ms / s / min) next to the value.</li>
+<li><b>Down time</b> - pause inserted between integrations (same units).</li>
 <li><b>Run mode</b> - choose <i>one</i>:
   <ul>
   <li><b>Number of integrations</b> - run an exact count, or</li>
@@ -199,12 +196,12 @@ MODE_NAMES = ("Capture", "View", "Compare")
 class _Run:
     """The run shown in Capture mode, fixed when it starts."""
 
-    name: str                       # file-name prefix
+    name: str
     run_dir: Path
     mode: MeasurementMode
     single_ms: float
     excitation_nm: Optional[float]
-    metadata: dict                  # processing settings for the CSV header
+    metadata: dict
 
 
 class SpectrometerGUI(QtWidgets.QMainWindow):
@@ -226,19 +223,17 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._syncing = False
         self._single_instance_server = None
 
-        # What the Capture plots show.
         self._run: Optional[_Run] = None
         self._wavelengths: Optional[np.ndarray] = None
-        self._scans: Optional[np.ndarray] = None    # one row per scan so far
-        self._latest: Optional[np.ndarray] = None   # most recent scan
+        self._scans: Optional[np.ndarray] = None
+        self._latest: Optional[np.ndarray] = None
         self._latest_index = 0
         self._latest_total = 0
-        self._buffer: Optional[np.ndarray] = None   # live-run scan storage
-        self._stats = None                          # cached ScanStats
+        self._buffer: Optional[np.ndarray] = None
+        self._stats = None
 
         self._connected = False
 
-        # Live updates are coalesced: scans can arrive faster than plots redraw.
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.setInterval(40)
@@ -690,7 +685,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             text += " Good for background-subtracted fluorescence."
         self.mode_hint.setText(text)
         self._apply_mode_param_enabled()
-        # Raman data is plotted against Raman shift unless the user picks otherwise.
         if mode is MeasurementMode.RAMAN:
             self.display.set_xunit(XUnit.RAMAN)
         elif self.display.xunit is XUnit.RAMAN:
@@ -705,7 +699,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.processor.excitation_nm = float(value)
         if self._run is not None and self._run.mode is MeasurementMode.RAMAN \
                 and not self._busy():
-            # Lets a mistyped excitation be corrected after a Raman run.
             self._run.excitation_nm = float(value)
             self._run.metadata["excitation_nm"] = float(value)
         self._redraw_capture()
@@ -999,9 +992,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Cannot start", miss)
             return
 
-        if not self._confirm_device_limits(settings):
-            return
-
         mismatch = self._integration_mismatch(settings.single_time_ms)
         if mismatch:
             reply = QtWidgets.QMessageBox.question(
@@ -1047,30 +1037,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._set_device_controls_enabled(False)
         self._set_busy_controls(False)
         self._update_status(f"Running -> {run_dir}")
-
-    def _confirm_device_limits(self, settings: AcquisitionSettings) -> bool:
-        """Ask before a run whose single integration time the device would clamp."""
-        requested = settings.single_time_ms
-        applied = self._clamp_ms(requested)
-        if abs(applied - requested) <= 1.0:
-            return True
-        lo, hi = self.spec.integration_limits_micros()
-        reply = QtWidgets.QMessageBox.question(
-            self, "Integration time out of range",
-            f"This spectrometer supports single integrations from "
-            f"{format_duration(lo / 1000.0)} to {format_duration(hi / 1000.0)}, so "
-            f"{format_duration(requested)} would run as {format_duration(applied)}."
-            "\n\nFor a longer exposure, keep the single integration within range and "
-            "take more integrations (or a longer total integration time)."
-            f"\n\nContinue with {format_duration(applied)} per integration?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
-        if reply != QtWidgets.QMessageBox.Yes:
-            return False
-        settings.single_time_ms = applied
-        self.single_time.set_milliseconds(applied, readable_unit=True)
-        self._sync_derived()
-        return True
 
     def _clamp_ms(self, ms: float) -> float:
         """The integration time the device would actually apply for ``ms``."""
@@ -1160,7 +1126,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._refresh_start_enabled()
         self._update_status("Acquisition failed.")
 
-    # ----- Capture plots ------------------------------------------------------
     def _y_from_zero(self) -> bool:
         return self._run.mode is MeasurementMode.SCOPE
 
@@ -1258,7 +1223,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
     def _on_fullscreen_closed(self, *_) -> None:
         self._fs_plot = None
 
-    # ----- saving -------------------------------------------------------------
     @staticmethod
     def _save_paper_figure(draw, out_path: str) -> None:
         """Render a paper-quality figure (300 DPI) via the given draw callback."""
