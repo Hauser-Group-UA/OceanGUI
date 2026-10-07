@@ -11,6 +11,26 @@ If no spectrometer (or backend) is present, the app automatically runs in
 
 ## Features
 
+- **Three modes** (the **Mode** menu, Ctrl+1/2/3):
+  - **Capture** - acquire spectra (everything below);
+  - **View** - open a saved run and step through its scans (or jump to a
+    scan number) next to the run average. It follows the most recent run
+    until you open a specific file;
+  - **Compare** - overlay the averages of several saved runs, in a reorderable
+    list (top = drawn on top) with colour-blind-safe colours that switch to
+    dashed/dotted lines after four, an optional clickable legend with editable
+    labels, and a **Redraw plot** button so large comparisons stay responsive.
+- **Wavelength / energy x-axis**: click any plot's x-axis label to switch
+  between wavelength (nm) and energy (eV) (and Raman shift for Raman data).
+  Intensities are converted with the Jacobian λ²/hc so peak shapes and areas
+  stay correct (counts keep their total; irradiance becomes µW/cm²/eV; ratios
+  are not rescaled).
+- **Read values off the plots**: hover to see the value under the cursor;
+  click to mark a point with its (x, y); right-click to clear.
+- **Automatic outlier filtering** (e.g. cosmic-ray spikes): each wavelength is
+  checked against the median of all scans with a robust σ, adjusted for the
+  number of scans; choose Off / 1.5σ / 2σ / 2.5σ / 3σ (default) live, from the
+  Acquire or Display tab.
 - **Live device panel**: a perpetual connection indicator (green = connected,
   red = disconnected), a drop-down of available devices, and **Connect**
   (also used to change device), **Reconnect**, and **Refresh** buttons. The
@@ -37,17 +57,22 @@ If no spectrometer (or backend) is present, the app automatically runs in
 - **Two run modes** (mutually exclusive):
   - *Number of integrations* — run an exact count, or
   - *Total integration time* — run for a total exposure (count = total ÷ single).
-- **Single integration time** and **down time between integrations** settings.
+- **Single integration time** and **down time between integrations** settings,
+  in ms, s, min or h.
 - **Uncertainty toggles**: 1σ / 2σ **bars** and 1σ / 2σ **bands** on the average.
 - **Required run name** before a run can start.
 - **Automatic outputs** on completion (into `saved_data/<name>_<timestamp>/`):
-  - `*_data.csv` — single integration time, wavelengths and intensities.
+  - `*_data.csv` — single integration time, wavelengths, every integration
+    and the outlier-filtered average/std.
+  - `*_average.csv` — two columns (wavelength, average) that open directly in
+    Excel.
   - `*_total.png` — picture of the total/average integration.
   - `*_average.png` — average integration, no bars/bands.
   - `*_average_overlay.png` — average in **red** over each individual
     integration in **grey**.
-- **Save total figure (with bars/bands)** button — saves the average plot with
-  the currently-enabled uncertainty overlays.
+- **Save outputs (current settings)** button — re-writes the run's files with
+  the current outlier filter and x-axis, plus the average plot with the
+  currently-enabled uncertainty overlays.
 - **Interrupt** button — stops an in-progress run after an *"Are you sure?"*
   confirmation; integrations collected so far are still saved.
 - **In-app Help menu** (also `F1`).
@@ -169,8 +194,11 @@ See [vendor/README.md](vendor/README.md) for more detail.
 3. Enter a **run name** (required — Start stays disabled until you do).
 4. Press **Start**. Plots update live; toggle 1σ/2σ bars and bands anytime.
    Press **Interrupt** to stop early (with confirmation) — partial data is kept.
-5. On completion the CSV and figures are saved automatically. Use
-   **Save total figure (with bars/bands)** for a copy with your chosen overlays.
+5. On completion the CSVs and figures are saved automatically. Use
+   **Save outputs (current settings)** after changing the outlier filter,
+   x-axis or bars/bands to re-write them.
+6. Switch to **View** (Mode menu) to inspect individual scans, or **Compare**
+   to overlay several runs.
 
 All output is stored inside the repository under `saved_data/`.
 
@@ -194,12 +222,16 @@ All output is stored inside the repository under `saved_data/`.
 OceanGUI/
 ├── ocean_gui/
 │   ├── main.py          # entry point
-│   ├── gui.py           # PyQt5 main window
+│   ├── gui.py           # PyQt5 main window, Mode menu + Capture mode
+│   ├── view_mode.py     # View mode (browse a saved run scan by scan)
+│   ├── compare_mode.py  # Compare mode (overlay run averages)
+│   ├── widgets.py       # shared widgets (interactive plot, side panel, ...)
 │   ├── acquisition.py   # settings model + acquisition/capture threads
 │   ├── spectrometer.py  # seabreeze wrapper + simulation fallback
-│   ├── processing.py    # measurement modes + dark/reference + smoothing
+│   ├── processing.py    # measurement modes, dark/reference, smoothing, outlier filter
+│   ├── units.py         # wavelength / energy / Raman-shift axes
 │   ├── plotting.py      # shared matplotlib rendering
-│   └── storage.py       # CSV / figure saving
+│   └── storage.py       # CSV / figure saving and loading
 ├── assets/
 │   ├── make_icon.py        # generates the app icon
 │   ├── make_shortcut.py    # creates the desktop shortcut (Linux/Windows)

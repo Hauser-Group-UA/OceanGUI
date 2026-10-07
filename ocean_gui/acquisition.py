@@ -43,8 +43,11 @@ class AcquisitionSettings:
 
 
 class AcquisitionWorker(QtCore.QThread):
-    progress = QtCore.pyqtSignal(int, int, object, object, object, object)
-    finished_ok = QtCore.pyqtSignal(object, object, object, object)  # wl, all, avg, std
+    """Collect processed scans. Averaging (with outlier filtering) is done by
+    the GUI, so the filter can be changed while the run is in progress."""
+
+    progress = QtCore.pyqtSignal(int, int, object, object)  # count, total, wl, scan
+    finished_ok = QtCore.pyqtSignal(object, object)         # wl, all scans
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, spec: SpectrometerInterface, settings: AcquisitionSettings,
@@ -82,11 +85,7 @@ class AcquisitionWorker(QtCore.QThread):
                     raw, wavelengths, settings.single_time_ms / 1000.0)
                 collected[count] = intensities
                 count += 1
-
-                stack = collected[:count]
-                avg = stack.mean(axis=0)
-                std = stack.std(axis=0, ddof=1) if count > 1 else np.zeros_like(avg)
-                self.progress.emit(count, total, wavelengths, intensities, avg, std)
+                self.progress.emit(count, total, wavelengths, intensities)
 
                 if settings.down_time_ms > 0 and i < total - 1:
                     self._sleep_ms(settings.down_time_ms)
@@ -95,10 +94,7 @@ class AcquisitionWorker(QtCore.QThread):
                 self.failed.emit("Acquisition aborted before any data was collected.")
                 return
 
-            stack = collected[:count]
-            avg = stack.mean(axis=0)
-            std = stack.std(axis=0, ddof=1) if count > 1 else np.zeros_like(avg)
-            self.finished_ok.emit(wavelengths, stack, avg, std)
+            self.finished_ok.emit(wavelengths, collected[:count])
         except Exception as exc:
             self.failed.emit(str(exc))
 

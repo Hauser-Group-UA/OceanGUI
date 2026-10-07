@@ -1,10 +1,14 @@
 import csv
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Iterable, Optional
 
 import numpy as np
+
+from .processing import MODE_LABELS, MODE_YLABELS, MeasurementMode
 
 
 def _base_dir() -> Path:
@@ -74,7 +78,7 @@ def save_csv(
     (e.g. measurement mode, corrections, smoothing, dark/reference state).
     """
     n_integrations = all_intensities.shape[0]
-    with open(path, "w", newline="") as fh:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
         fh.write(f"# single_integration_time_ms,{single_time_ms}\n")
         fh.write(f"# n_integrations,{n_integrations}\n")
         for key, value in (metadata or {}).items():
@@ -90,3 +94,167 @@ def save_csv(
             row += [f"{average[j]:.4f}", f"{std[j]:.4f}"]
             writer.writerow(row)
     return path
+
+
+def save_average_csv(path: Path, wavelengths: np.ndarray, average: np.ndarray,
+                     ylabel: str = "Intensity (counts)") -> Path:
+    """Write a plain two-column file (wavelength, average) that opens in Excel.
+
+    One header row and no comment lines; the UTF-8 byte-order mark makes Excel
+    show units such as µ and ² correctly.
+    """
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["Wavelength (nm)", f"Average {ylabel[:1].lower()}{ylabel[1:]}"])
+        for wl, value in zip(wavelengths, average):
+            writer.writerow([f"{wl:.4f}", f"{value:.6g}"])
+    return path
+
+
+_RUN_FOLDER = re.compile(r"^(?P<name>.+)_(?P<stamp>\d{8}_\d{6})$")
+
+
+@dataclass
+class RunData:
+    """A saved run read back from its ``*_data.csv`` file."""
+
+    path: Path
+    wavelengths: np.ndarray
+    scans: np.ndarray                       # one row per scan
+    metadata: Dict[str, str] = field(default_factory=dict)
+    header_ylabel: Optional[str] = None     # from a two-column average file
+
+    @property
+    def n_scans(self) -> int:
+        return int(self.scans.shape[0])
+
+    @property
+    def run_name(self) -> str:
+        """The name the run was saved under (folder name minus its timestamp)."""
+        match = _RUN_FOLDER.match(self.path.parent.name)
+        if match:
+            return match.group("name")
+        stem = self.path.stem
+        for suffix in ("_data", "_average"):
+            if stem.endswith(suffix):
+                return stem[:-len(suffix)]
+        return stem
+
+    @property
+    def display_name(self) -> str:
+        """Run folder name (name + timestamp) when it has one, else the file name."""
+        if _RUN_FOLDER.match(self.path.parent.name):
+            return self.path.parent.name
+        return self.path.name
+
+    @property
+    def acquired(self) -> Optional[datetime]:
+        match = _RUN_FOLDER.match(self.path.parent.name)
+        if match:
+            try:
+                return datetime.strptime(match.group("stamp"), "%Y%m%d_%H%M%S")
+            except ValueError:
+                pass
+        return None
+
+    @property
+    def mode(self) -> Optional[MeasurementMode]:
+        mode_id = self.metadata.get("measurement_mode_id")
+        for mode in MeasurementMode:
+            if mode.value == mode_id:
+                return mode
+        label = self.metadata.get("measurement_mode")
+        for mode, text in MODE_LABELS.items():
+            if text == label:
+                return mode
+        for mode, text in MODE_YLABELS.items():
+            if text == self.ylabel:
+                return mode
+        return None
+
+    @property
+    def ylabel(self) -> str:
+        if self.metadata.get("quantity"):
+            return self.metadata["quantity"]
+        if self.header_ylabel:
+            return self.header_ylabel
+        return "Intensity (counts)"
+
+    @property
+    def excitation_nm(self) -> Optional[float]:
+        return _to_float(self.metadata.get("excitation_nm"))
+
+    @property
+    def integration_ms(self) -> Optional[float]:
+        return _to_float(self.metadata.get("single_integration_time_ms"))
+
+
+def _to_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_text(path: Path) -> str:
+    """Files written on Windows by older versions may not be UTF-8."""
+    raw = Path(path).read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def load_run(path) -> RunData:
+    """Read a run's ``*_data.csv`` (or a two-column ``*_average.csv``)."""
+    path = Path(path)
+    lines = _read_text(path).splitlines()
+    metadata: Dict[str, str] = {}
+    header, start = None, 0
+    for i, line in enumerate(lines):
+        if line.startswith("#"):
+            key, _, value = line[1:].partition(",")
+            metadata[key.strip()] = value.strip()
+        elif line.strip():
+            header, start = next(csv.reader([line])), i + 1
+            break
+    if not header or not header[0].strip().lower().startswith("wavelength"):
+        raise ValueError("not a saved spectrum: the first column must be the wavelength.")
+    try:
+        data = np.loadtxt(lines[start:], delimiter=",", ndmin=2)
+    except ValueError as exc:
+        raise ValueError(f"could not read the numeric data ({exc}).") from exc
+    if data.shape[0] < 2 or data.shape[1] < 2:
+        raise ValueError("the file holds no spectrum data.")
+
+    names = [h.strip() for h in header]
+    columns = [i for i, name in enumerate(names) if name.startswith("integration_")]
+    if not columns:
+        columns = [names.index("average")] if "average" in names else [1]
+    header_ylabel = None
+    if len(names) == 2 and names[1].lower().startswith("average "):
+        text = names[1][len("average "):]
+        header_ylabel = text[:1].upper() + text[1:]
+    return RunData(path=path, wavelengths=data[:, 0].copy(),
+                   scans=np.ascontiguousarray(data[:, columns].T),
+                   metadata=metadata, header_ylabel=header_ylabel)
+
+
+def find_latest_run(save_dir: Path, extra: Iterable[Optional[Path]] = ()) -> Optional[Path]:
+    """The most recently written ``*_data.csv`` under ``save_dir`` (or in ``extra``)."""
+    candidates = [Path(p) for p in extra if p is not None]
+    try:
+        candidates += list(Path(save_dir).rglob("*_data.csv"))
+    except OSError:
+        pass
+    best, best_time = None, None
+    for candidate in candidates:
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if best_time is None or mtime > best_time:
+            best, best_time = candidate, mtime
+    return best

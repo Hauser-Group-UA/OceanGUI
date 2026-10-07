@@ -15,6 +15,19 @@ LEGEND_FONTSIZE = 11
 XLABEL = "Wavelength (nm)"
 YLABEL = "Intensity (counts)"
 
+PROBE_GID = "probe:"
+
+COMPARE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7")  # blue, orange, aqua, violet
+COMPARE_LINESTYLES = ("-", "--", ":", "-.")
+COMPARE_LINEWIDTH = 1.4
+
+
+def compare_style(index: int):
+    """(colour, linestyle) for the ``index``-th style slot: colours first, then dashes."""
+    n = len(COMPARE_COLORS)
+    return (COMPARE_COLORS[index % n],
+            COMPARE_LINESTYLES[(index // n) % len(COMPARE_LINESTYLES)])
+
 
 def style_axes(ax, wavelengths=None, *, y_from_zero: bool = False,
                ylabel: str = YLABEL, xlabel: str = XLABEL) -> None:
@@ -28,7 +41,7 @@ def style_axes(ax, wavelengths=None, *, y_from_zero: bool = False,
     ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE)
 
     if wavelengths is not None and np.size(wavelengths) > 1:
-        ax.set_xlim(float(np.min(wavelengths)), float(np.max(wavelengths)))
+        ax.set_xlim(float(np.nanmin(wavelengths)), float(np.nanmax(wavelengths)))
     ax.margins(y=0.02)
     if y_from_zero:
         ax.set_ylim(bottom=0.0)
@@ -42,24 +55,26 @@ def style_axes(ax, wavelengths=None, *, y_from_zero: bool = False,
         spine.set_linewidth(1.0)
 
 
-def draw_placeholder(ax) -> None:
+def draw_placeholder(ax, message: str = "Awaiting acquisition\n(example axes)", *,
+                     xlabel: str = XLABEL, ylabel: str = YLABEL) -> None:
     """Draw example dummy axes shown before any real data exists."""
     x = np.linspace(0, 10, 200)
     y = np.sin(x) * np.exp(-0.1 * x)
     ax.clear()
     ax.plot(x, y, color=GREY, linestyle="--", linewidth=1.0)
-    ax.text(0.5, 0.5, "Awaiting acquisition\n(example axes)",
+    ax.text(0.5, 0.5, message,
             transform=ax.transAxes, ha="center", va="center",
             fontsize=12, color="#666666",
             bbox=dict(boxstyle="round", fc="white", ec="#cccccc"))
-    style_axes(ax, x)
+    style_axes(ax, x, xlabel=xlabel, ylabel=ylabel)
 
 
 def draw_current(ax, wavelengths, intensities, *, ylabel: str = YLABEL,
-                 xlabel: str = XLABEL, y_from_zero: bool = True) -> None:
+                 xlabel: str = XLABEL, y_from_zero: bool = True,
+                 gid: str = None) -> None:
     """Draw the most recent single integration."""
     ax.clear()
-    ax.plot(wavelengths, intensities, color=LINE_BLUE, linewidth=1.0)
+    ax.plot(wavelengths, intensities, color=LINE_BLUE, linewidth=1.0, gid=gid)
     style_axes(ax, wavelengths, y_from_zero=y_from_zero, ylabel=ylabel, xlabel=xlabel)
 
 
@@ -77,6 +92,7 @@ def draw_average(
     ylabel: str = YLABEL,
     xlabel: str = XLABEL,
     y_from_zero: bool = False,
+    gid: str = None,
 ) -> None:
     """Draw the average spectrum with optional uncertainty bars/bands."""
     ax.clear()
@@ -91,16 +107,14 @@ def draw_average(
                         color=BAND_1, alpha=0.25, label=r"1$\sigma$ band")
 
     if bars_1sigma or bars_2sigma:
-        n = wavelengths.size
-        step = max(1, n // 60)
-        idx = np.arange(0, n, step)
+        idx = _bar_indices(np.size(wavelengths))
         k = 2 if bars_2sigma else 1
         label = r"2$\sigma$ bars" if bars_2sigma else r"1$\sigma$ bars"
         ax.errorbar(wavelengths[idx], average[idx], yerr=k * std[idx],
                     fmt="none", ecolor="#444444", elinewidth=0.8,
                     capsize=2, alpha=0.7, label=label)
 
-    ax.plot(wavelengths, average, color=color, linewidth=1.2, label="average")
+    ax.plot(wavelengths, average, color=color, linewidth=1.2, label="average", gid=gid)
     style_axes(ax, wavelengths, y_from_zero=y_from_zero, ylabel=ylabel, xlabel=xlabel)
     if bars_1sigma or bars_2sigma or band_1sigma or band_2sigma:
         ax.legend(loc="upper right", fontsize=LEGEND_FONTSIZE, framealpha=0.9)
@@ -114,3 +128,44 @@ def draw_overlay(ax, wavelengths, all_intensities, average, *, ylabel: str = YLA
         ax.plot(wavelengths, row, color=GREY, linewidth=0.6, alpha=0.5)
     ax.plot(wavelengths, average, color=LINE_RED, linewidth=1.4)
     style_axes(ax, wavelengths, y_from_zero=y_from_zero, ylabel=ylabel, xlabel=xlabel)
+
+
+def draw_compare(ax, series, *, bars_1sigma: bool = False, bars_2sigma: bool = False,
+                 band_1sigma: bool = False, band_2sigma: bool = False,
+                 legend: bool = True, ylabel: str = YLABEL, xlabel: str = XLABEL,
+                 y_from_zero: bool = False) -> None:
+    """Overlay several averages; the first series is drawn on top.
+
+    Each series is a dict with keys x, y, std, color, linestyle, label, gid.
+    """
+    ax.clear()
+    n = len(series)
+    lines = []
+    for i, s in enumerate(series):
+        x, y, std = s["x"], s["y"], s["std"]
+        z = 2 + 3 * (n - i)
+        if band_2sigma:
+            ax.fill_between(x, y - 2 * std, y + 2 * std, color=s["color"],
+                            alpha=0.10, linewidth=0, zorder=z)
+        if band_1sigma:
+            ax.fill_between(x, y - std, y + std, color=s["color"],
+                            alpha=0.22, linewidth=0, zorder=z)
+        if bars_1sigma or bars_2sigma:
+            idx = _bar_indices(np.size(x))
+            k = 2 if bars_2sigma else 1
+            ax.errorbar(x[idx], y[idx], yerr=k * std[idx], fmt="none",
+                        ecolor=s["color"], elinewidth=0.8, capsize=2, alpha=0.7,
+                        zorder=z + 1)
+        line, = ax.plot(x, y, color=s["color"], linestyle=s["linestyle"],
+                        linewidth=COMPARE_LINEWIDTH, label=s["label"],
+                        gid=s.get("gid"), zorder=z + 2)
+        lines.append(line)
+    all_x = np.concatenate([np.asarray(s["x"], dtype=float) for s in series])
+    style_axes(ax, all_x, y_from_zero=y_from_zero, ylabel=ylabel, xlabel=xlabel)
+    if legend and lines:
+        ax.legend(handles=lines, loc="best", fontsize=LEGEND_FONTSIZE, framealpha=0.9)
+
+
+def _bar_indices(n: int) -> np.ndarray:
+    """About 60 evenly spaced points, so error bars stay legible."""
+    return np.arange(0, n, max(1, n // 60))

@@ -1,27 +1,39 @@
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import plotting, storage
 from .acquisition import (AcquisitionSettings, AcquisitionWorker, CaptureWorker,
                           RunMode)
+from .compare_mode import ComparePage
 from .processing import (MODE_LABELS, MODE_YLABELS, MeasurementMode, Processor,
                          requires_calibration, requires_dark, requires_excitation,
-                         requires_reference)
+                         requires_reference, scan_statistics)
 from .spectrometer import SpectrometerError, SpectrometerInterface, backend_status
+from .units import XUnit, available_units, spectral_axis
+from .view_mode import ViewPage
+from .widgets import (DisplaySettings, FullScreenPlot, SidePanel, SpectrumPlot,
+                      TimeField, UncertaintyBox, breakable, describe_outliers,
+                      format_duration, outlier_group, scroll_page)
 
 HELP_TEXT = """\
 <h2>Ocean Spectrometer GUI - Help</h2>
 
-<p>The left panel is split into three tabs - <b>Acquire</b> (device + timing +
-run name), <b>Processing</b> (measurement mode, dark/reference, parameters,
-corrections) and <b>Display</b> (uncertainty overlays). The <b>Start</b> /
-<b>Interrupt</b> / <b>Save</b> controls stay pinned below the tabs at all times.</p>
+<p>Use the <b>Mode</b> menu (Ctrl+1/2/3) to switch between <b>Capture</b>
+(acquire spectra), <b>View</b> (step through a saved run scan by scan) and
+<b>Compare</b> (overlay the averages of several runs). An acquisition keeps
+running while you look at the other modes.</p>
+
+<p>In Capture mode the left panel is split into three tabs - <b>Acquire</b>
+(device + timing + outlier filter + run name), <b>Processing</b> (measurement
+mode, dark/reference, parameters, corrections) and <b>Display</b> (outlier
+filter, uncertainty overlays). The <b>Start</b> / <b>Interrupt</b> /
+<b>Save</b> controls stay pinned below the tabs at all times.</p>
 
 <h3>1. Connect</h3>
 <p>The <b>Device</b> panel shows a live connection indicator: a
@@ -43,8 +55,11 @@ disturbing the running one.</p>
 <h3>2. Settings</h3>
 <ul>
 <li><b>Single integration</b> - exposure time of one spectrum. Pick the unit
-    (ms / s / min) next to the value.</li>
-<li><b>Down time</b> - pause inserted between integrations (same units).</li>
+    (ms / s / min / h) next to the value. If it is outside what the
+    spectrometer supports (most models allow at most about a minute), you are
+    told the closest time the device can do before the run starts.</li>
+<li><b>Down time</b> - pause inserted between integrations (same units) -
+    e.g. 1 h for one spectrum per hour.</li>
 <li><b>Run mode</b> - choose <i>one</i>:
   <ul>
   <li><b>Number of integrations</b> - run an exact count, or</li>
@@ -105,129 +120,133 @@ smoothing (0 = off).</p>
 
 <h3>8. Plots</h3>
 <p>Left shows the <b>current</b> integration; right shows the running
-<b>average</b>, with axes labelled for the selected mode (the x-axis becomes
-Raman shift in Raman mode). Example dummy axes are shown until data arrives.
-Use the checkboxes to toggle <b>1σ / 2σ uncertainty bars and bands</b>.
-Click the <b>⤢</b> button above the average plot (or double-click the plot) to
-<b>maximise it to full screen</b>; press <b>Esc</b> to exit.</p>
+<b>average</b>, with axes labelled for the run's measurement mode. Example dummy
+axes are shown until data arrives. Use the checkboxes on the <b>Display</b> tab
+to toggle <b>1σ / 2σ uncertainty bars and bands</b>. Click the <b>⤢</b> button
+above the average plot (or double-click the plot) to <b>maximise it to full
+screen</b>; press <b>Esc</b> to exit.</p>
+<ul>
+<li><b>X-axis units</b> - click the x-axis label (marked ▾) and pick
+    <b>Wavelength (nm)</b> or <b>Energy (eV)</b> (plus <b>Raman shift</b> for
+    Raman data). The choice applies to every plot and to saved figures. On an
+    energy axis intensities are converted with the Jacobian
+    |dλ/dE| = λ²/hc so peak shapes and areas stay correct: counts are
+    renormalised so the total number of counts is unchanged, irradiance becomes
+    µW/cm²/eV, and ratios (absorbance, %T, %R) are not rescaled.</li>
+<li><b>Reading values</b> - hover over a plot to see the value under the
+    cursor below it. <b>Click</b> to mark the nearest data point with its
+    (x, y) value; <b>right-click</b> clears the mark. During a run the mark
+    stays at the same x and follows the live data.</li>
+</ul>
 
-<h3>9. Saved files</h3>
+<h3>9. Outlier filtering</h3>
+<p>Extreme outliers (e.g. cosmic-ray spikes) are removed automatically before
+averaging. Each wavelength is judged on its own: a scan's value there is dropped
+when it lies more than the chosen number of σ from the median of all scans at
+that wavelength. σ is estimated robustly (1.4826 × the median absolute
+deviation), so one huge spike cannot hide by inflating σ. With few scans that
+estimate is noisy, so the cut is widened automatically for the number of scans:
+on pure noise each setting removes the textbook fraction of values (13% at
+1.5σ, 4.6% at 2σ, 1.2% at 2.5σ, 0.27% at 3σ) whether you took 5 scans or 500.
+Pick <b>Off</b>, 1.5σ, 2σ, 2.5σ or <b>3σ</b> (default) on the <b>Acquire</b> or
+<b>Display</b> tab - the two are linked, and changes apply immediately, even
+mid-run. Filtering needs at least 3 scans (with very few scans only large
+spikes can be told apart from noise). The average plot's title shows how many
+values were removed.</p>
+
+<h3>10. Saved files</h3>
 <p>When a run finishes these are written automatically:</p>
 <ul>
-<li><code>*_data.csv</code> - integration time, wavelengths and intensities.</li>
+<li><code>*_data.csv</code> - integration time, wavelengths, every integration,
+    and the outlier-filtered average and std (the header records the filter).</li>
+<li><code>*_average.csv</code> - just two columns, wavelength and average, ready
+    to open in Excel.</li>
 <li><code>*_total.png</code> - picture of the total/average integration.</li>
 <li><code>*_average.png</code> - average integration, no bars/bands.</li>
 <li><code>*_average_overlay.png</code> - average in red over each individual
     integration in grey.</li>
 </ul>
-<p>The <b>Save total figure (with bars/bands)</b> button writes the average plot
-with whatever uncertainty toggles are currently enabled.</p>
+<p><b>Save outputs (current settings)</b> re-writes all of these with the
+current outlier filter and x-axis, and also saves
+<code>*_total_with_uncertainty.png</code> with the bars/bands enabled on the
+Display tab. Every individual scan is always kept, so nothing is lost by
+re-saving.</p>
+
+<h3>11. View mode</h3>
+<p>Shows one saved run: the left plot is a single scan, the right plot the run
+average (with the same outlier filter, uncertainty and x-axis options). It opens
+the most recent run automatically and moves to each new run you acquire, until
+you <b>Open…</b> a specific file (<b>Latest run</b> goes back to following).
+Step through scans with the arrow buttons (hold to repeat) or the slider, or
+type a scan number and press Enter to jump straight to it.</p>
+
+<h3>12. Compare mode</h3>
+<p><b>Add files…</b> to overlay the <i>average</i> of each run. The list order
+is the drawing order - the top entry is drawn on top; use ▲ / ▼ to reorder and
+✕ to remove. To stay responsive with many files, changes (files, order, units,
+filter, bars/bands, legend) are only drawn when you press <b>Redraw plot</b> - a
+yellow banner shows when changes are waiting. Lines use four colour-blind-safe
+colours; after four, the line style changes (dashed, dotted, dash-dot). Each run
+keeps its colour when the list is reordered. Toggle the legend with <b>Show
+legend</b>; click the legend on the plot (or <b>Edit labels…</b>) to rename the
+entries. <b>Save figure…</b> writes the comparison at 300 DPI.</p>
 """
 
-
-class TimeField(QtWidgets.QWidget):
-    """A value spin-box plus a ms/s/min unit selector. Time is stored in ms."""
-
-    changed = QtCore.pyqtSignal()
-    _UNITS = (("ms", 1.0), ("s", 1000.0), ("min", 60000.0))
-
-    def __init__(self, default_ms: float = 1000.0, default_unit: str = "s",
-                 parent=None) -> None:
-        super().__init__(parent)
-        self._mult = dict(self._UNITS)
-        self._ms = float(default_ms)
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        self.spin = QtWidgets.QDoubleSpinBox()
-        self.spin.setDecimals(3)
-        self.spin.setRange(0.0, 1.0e9)
-        self.unit = QtWidgets.QComboBox()
-        for name, _ in self._UNITS:
-            self.unit.addItem(name)
-        self.unit.setCurrentText(default_unit)
-        lay.addWidget(self.spin, 1)
-        lay.addWidget(self.unit, 0)
-        self._display_from_ms()
-        self.spin.valueChanged.connect(self._on_spin)
-        self.unit.currentIndexChanged.connect(self._on_unit_changed)
-
-    def _on_spin(self, *_) -> None:
-        self._ms = self.spin.value() * self._mult[self.unit.currentText()]
-        self.changed.emit()
-
-    def _on_unit_changed(self) -> None:
-        self._display_from_ms()
-        self.changed.emit()
-
-    def _display_from_ms(self) -> None:
-        self.spin.blockSignals(True)
-        self.spin.setValue(self._ms / self._mult[self.unit.currentText()])
-        self.spin.blockSignals(False)
-
-    def milliseconds(self) -> float:
-        return self._ms
-
-    def set_milliseconds(self, ms: float) -> None:
-        self._ms = float(ms)
-        self._display_from_ms()
+MODE_NAMES = ("Capture", "View", "Compare")
 
 
-class FullScreenPlot(QtWidgets.QDialog):
-    """A full-screen view of one plot. Esc or the button exits full screen."""
+@dataclass
+class _Run:
+    """The run shown in Capture mode, fixed when it starts."""
 
-    def __init__(self, title: str, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.figure = Figure(tight_layout=True)
-        self.ax = self.figure.add_subplot(111)
-        self.canvas = FigureCanvas(self.figure)
-        lay.addWidget(self.canvas, 1)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)
-        btn = QtWidgets.QPushButton("Exit full screen (Esc)")
-        btn.clicked.connect(self.close)
-        row.addWidget(btn)
-        lay.addLayout(row)
-
-    def render(self, draw_fn) -> None:
-        draw_fn(self.ax)
-        self.canvas.draw()
+    name: str                       # file-name prefix
+    run_dir: Path
+    mode: MeasurementMode
+    single_ms: float
+    excitation_nm: Optional[float]
+    metadata: dict                  # processing settings for the CSV header
 
 
 class SpectrometerGUI(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Ocean Spectrometer GUI")
+        self.setWindowTitle(f"Ocean Spectrometer GUI - {MODE_NAMES[0]}")
         self.resize(1180, 720)
 
         self.spec: Optional[SpectrometerInterface] = None
         self.worker: Optional[AcquisitionWorker] = None
         self.capture_worker: Optional[CaptureWorker] = None
-        self.run_dir: Optional[Path] = None
 
         self.processor = Processor()
+        self.display = DisplaySettings(self)
         self._dark_integ_ms: Optional[float] = None
         self._ref_integ_ms: Optional[float] = None
-        self._run_xvalues: Optional[np.ndarray] = None
-        self._run_xlabel = ""
-        self._run_ylabel = ""
-        self._run_y0 = True
         self._save_dir = storage.DEFAULT_SAVE_DIR
         self._fs_plot: Optional[FullScreenPlot] = None
         self._syncing = False
         self._single_instance_server = None
 
+        # What the Capture plots show.
+        self._run: Optional[_Run] = None
         self._wavelengths: Optional[np.ndarray] = None
-        self._all_intensities: Optional[np.ndarray] = None
-        self._average: Optional[np.ndarray] = None
-        self._std: Optional[np.ndarray] = None
+        self._scans: Optional[np.ndarray] = None    # one row per scan so far
+        self._latest: Optional[np.ndarray] = None   # most recent scan
+        self._latest_index = 0
+        self._latest_total = 0
+        self._buffer: Optional[np.ndarray] = None   # live-run scan storage
+        self._stats = None                          # cached ScanStats
 
         self._connected = False
 
+        # Live updates are coalesced: scans can arrive faster than plots redraw.
+        self._redraw_timer = QtCore.QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.setInterval(40)
+        self._redraw_timer.timeout.connect(self._redraw_capture)
+
         self._build_ui()
+        self.display.xunit_changed.connect(self._on_xunit_changed)
+        self.display.outlier_changed.connect(self._on_outlier_changed)
         self._update_status(f"Backend: {backend_status()}")
         self._refresh_devices()
         self._set_connection_indicator(False, "Not connected")
@@ -246,13 +265,21 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
     def _build_ui(self) -> None:
         self._build_menu()
+        self.pages = QtWidgets.QStackedWidget()
+        self.setCentralWidget(self.pages)
+        self.pages.addWidget(self._build_capture_page())
+        self.view_page = ViewPage(self.display, lambda: self._save_dir)
+        self.compare_page = ComparePage(self.display, lambda: self._save_dir)
+        for page in (self.view_page, self.compare_page):
+            page.status_message.connect(self._update_status)
+            self.pages.addWidget(page)
+        self.status = self.statusBar()
 
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        layout = QtWidgets.QHBoxLayout(central)
+    def _build_capture_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(page)
 
-        left_col = QtWidgets.QWidget()
-        left_col.setFixedWidth(350)
+        left_col = SidePanel()
         left_layout = QtWidgets.QVBoxLayout(left_col)
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.setSpacing(4)
@@ -265,11 +292,26 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
         layout.addWidget(left_col, 0)
         layout.addWidget(self._build_plots(), 1)
-
-        self.status = self.statusBar()
+        return page
 
     def _build_menu(self) -> None:
         menubar = self.menuBar()
+        mode_menu = menubar.addMenu("&Mode")
+        self._mode_group = QtWidgets.QActionGroup(self)
+        self._mode_group.setExclusive(True)
+        for index, (text, shortcut, tip) in enumerate((
+                ("&Capture", "Ctrl+1", "Acquire spectra from the spectrometer"),
+                ("&View", "Ctrl+2", "Step through the scans of a saved run"),
+                ("C&ompare", "Ctrl+3", "Overlay the averages of several saved runs"))):
+            action = QtWidgets.QAction(text, self, checkable=True)
+            action.setShortcut(shortcut)
+            action.setStatusTip(tip)
+            action.setData(index)
+            self._mode_group.addAction(action)
+            mode_menu.addAction(action)
+        self._mode_group.actions()[0].setChecked(True)
+        self._mode_group.triggered.connect(lambda action: self._set_mode(action.data()))
+
         help_menu = menubar.addMenu("&Help")
         help_action = QtWidgets.QAction("Help / How to use", self)
         help_action.setShortcut("F1")
@@ -279,35 +321,28 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
+    def _set_mode(self, index: int) -> None:
+        self.pages.setCurrentIndex(index)
+        self.setWindowTitle(f"Ocean Spectrometer GUI - {MODE_NAMES[index]}")
+        if index == 1:
+            self.view_page.activate()
+
     def _build_controls(self) -> QtWidgets.QWidget:
         """The left-hand settings, organised into tabs."""
         tabs = QtWidgets.QTabWidget()
         tabs.setDocumentMode(True)
-        tabs.addTab(self._scroll_page([self._group_device(),
-                                       self._group_acquisition(),
-                                       self._group_runname()]), "Acquire")
-        tabs.addTab(self._scroll_page([self._group_mode(),
-                                       self._group_background(),
-                                       self._group_params(),
-                                       self._group_corrections()]), "Processing")
-        tabs.addTab(self._scroll_page([self._group_uncertainty()]), "Display")
+        tabs.addTab(scroll_page([self._group_device(),
+                                 self._group_acquisition(),
+                                 outlier_group(self.display),
+                                 self._group_runname()]), "Acquire")
+        tabs.addTab(scroll_page([self._group_mode(),
+                                 self._group_background(),
+                                 self._group_params(),
+                                 self._group_corrections()]), "Processing")
+        self.uncertainty = UncertaintyBox()
+        self.uncertainty.changed.connect(self._redraw_average)
+        tabs.addTab(scroll_page([outlier_group(self.display), self.uncertainty]), "Display")
         return tabs
-
-    @staticmethod
-    def _scroll_page(groups) -> QtWidgets.QWidget:
-        """Wrap a list of group-boxes in a scrollable tab page."""
-        inner = QtWidgets.QWidget()
-        vb = QtWidgets.QVBoxLayout(inner)
-        vb.setContentsMargins(6, 6, 6, 6)
-        for group in groups:
-            vb.addWidget(group)
-        vb.addStretch(1)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(inner)
-        return scroll
 
     def _group_device(self) -> QtWidgets.QGroupBox:
         conn_box = QtWidgets.QGroupBox("Device")
@@ -521,24 +556,6 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         cl.addRow("Boxcar width:", self.boxcar_width)
         return c_box
 
-    def _group_uncertainty(self) -> QtWidgets.QGroupBox:
-        u_box = QtWidgets.QGroupBox("Uncertainty (average plot)")
-        ub = QtWidgets.QGridLayout(u_box)
-        self.cb_bars1 = QtWidgets.QCheckBox("1σ bars")
-        self.cb_bars2 = QtWidgets.QCheckBox("2σ bars")
-        self.cb_band1 = QtWidgets.QCheckBox("1σ band")
-        self.cb_band2 = QtWidgets.QCheckBox("2σ band")
-        for w in (self.cb_bars1, self.cb_bars2, self.cb_band1, self.cb_band2):
-            w.toggled.connect(self._redraw_average)
-        self.cb_bars1.toggled.connect(lambda on: on and self.cb_bars2.setChecked(False))
-        self.cb_bars2.toggled.connect(lambda on: on and self.cb_bars1.setChecked(False))
-        ub.addWidget(self.cb_bars1, 0, 0)
-        ub.addWidget(self.cb_bars2, 0, 1)
-        ub.addWidget(self.cb_band1, 1, 0)
-        ub.addWidget(self.cb_band2, 1, 1)
-        ub.setRowStretch(2, 1)
-        return u_box
-
     def _build_action_bar(self) -> QtWidgets.QWidget:
         """Run controls that stay pinned below the scrollable settings."""
         bar = QtWidgets.QWidget()
@@ -556,8 +573,12 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         row.addWidget(self.stop_btn)
         lay.addLayout(row)
 
-        self.save_btn = QtWidgets.QPushButton("Save total figure (with bars/bands)")
-        self.save_btn.clicked.connect(self._save_total_with_uncertainty)
+        self.save_btn = QtWidgets.QPushButton("Save outputs (current settings)")
+        self.save_btn.setToolTip(
+            "Re-write this run's CSV files and figures with the current outlier "
+            "filter and x-axis, plus *_total_with_uncertainty.png with the "
+            "bars/bands enabled on the Display tab")
+        self.save_btn.clicked.connect(self._save_outputs)
         self.save_btn.setEnabled(False)
         lay.addWidget(self.save_btn)
 
@@ -565,61 +586,22 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         lay.addWidget(self.progress)
         return bar
 
-    @staticmethod
-    def _plot_header(label: QtWidgets.QLabel, button=None) -> QtWidgets.QWidget:
-        """A fixed-height centred header row, so both plot columns line up."""
-        w = QtWidgets.QWidget()
-        w.setFixedHeight(34)
-        row = QtWidgets.QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addStretch(1)
-        row.addWidget(label)
-        row.addStretch(1)
-        if button is not None:
-            row.addWidget(button, 0)
-        return w
-
     def _build_plots(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(panel)
-
-        self._header_font = QtGui.QFont()
-        self._header_font.setBold(True)
-        self._header_font.setPointSize(12)
-
-        left = QtWidgets.QVBoxLayout()
-        self.current_header = QtWidgets.QLabel("Current integration")
-        self.current_header.setFont(self._header_font)
-        self.fig_current = Figure(figsize=(5, 4), tight_layout=True)
-        self.ax_current = self.fig_current.add_subplot(111)
-        self.canvas_current = FigureCanvas(self.fig_current)
-        left.addWidget(self._plot_header(self.current_header), 0)
-        left.addWidget(self.canvas_current, 1)
-
-        right = QtWidgets.QVBoxLayout()
-        self.avg_header = QtWidgets.QLabel("Average integration")
-        self.avg_header.setFont(self._header_font)
+        self.plot_current = SpectrumPlot("Current integration")
         self.fullscreen_btn = QtWidgets.QToolButton()
         self.fullscreen_btn.setText("⤢")
         self.fullscreen_btn.setToolTip("Maximise the average plot to full screen "
                                        "(double-click the plot; Esc exits)")
         self.fullscreen_btn.clicked.connect(self._open_fullscreen_average)
-        self.fig_avg = Figure(figsize=(5, 4), tight_layout=True)
-        self.ax_avg = self.fig_avg.add_subplot(111)
-        self.canvas_avg = FigureCanvas(self.fig_avg)
-        self.canvas_avg.mpl_connect(
-            "button_press_event",
-            lambda e: e.dblclick and self._open_fullscreen_average())
-        right.addWidget(self._plot_header(self.avg_header, self.fullscreen_btn), 0)
-        right.addWidget(self.canvas_avg, 1)
-
-        h.addLayout(left, 1)
-        h.addLayout(right, 1)
-
-        plotting.draw_placeholder(self.ax_current)
-        plotting.draw_placeholder(self.ax_avg)
-        self.canvas_current.draw()
-        self.canvas_avg.draw()
+        self.plot_avg = SpectrumPlot("Average integration", header_widget=self.fullscreen_btn)
+        self.plot_avg.double_clicked.connect(self._open_fullscreen_average)
+        for plot in (self.plot_current, self.plot_avg):
+            plot.unit_selected.connect(self.display.set_xunit)
+        h.addWidget(self.plot_current, 1)
+        h.addWidget(self.plot_avg, 1)
+        self._draw_placeholders()
         return panel
 
     def _update_mode_enabled(self) -> None:
@@ -680,7 +662,8 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._update_savedir_label()
 
     def _update_savedir_label(self) -> None:
-        self.savedir_label.setText(f"Saving to: {self._save_dir}")
+        self.savedir_label.setText(breakable(f"Saving to: {self._save_dir}"))
+        self.savedir_label.setToolTip(str(self._save_dir))
 
     def _current_mode(self) -> MeasurementMode:
         return self.mode_combo.currentData()
@@ -707,14 +690,25 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             text += " Good for background-subtracted fluorescence."
         self.mode_hint.setText(text)
         self._apply_mode_param_enabled()
-        self._redraw_current_and_average()
+        # Raman data is plotted against Raman shift unless the user picks otherwise.
+        if mode is MeasurementMode.RAMAN:
+            self.display.set_xunit(XUnit.RAMAN)
+        elif self.display.xunit is XUnit.RAMAN:
+            self.display.set_xunit(XUnit.WAVELENGTH)
+        if self._scans is None:
+            self._draw_placeholders()
 
     def _on_boxcar_changed(self, value: int) -> None:
         self.processor.boxcar_width = int(value)
 
     def _on_excitation_changed(self, value: float) -> None:
         self.processor.excitation_nm = float(value)
-        self._redraw_current_and_average()
+        if self._run is not None and self._run.mode is MeasurementMode.RAMAN \
+                and not self._busy():
+            # Lets a mistyped excitation be corrected after a Raman run.
+            self._run.excitation_nm = float(value)
+            self._run.metadata["excitation_nm"] = float(value)
+        self._redraw_capture()
 
     def _on_area_changed(self, value: float) -> None:
         self.processor.collection_area_cm2 = float(value)
@@ -750,8 +744,8 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                 f"Could not read '{path}':\n{exc}\n\n"
                 "Expected two columns: wavelength_nm, microjoule_per_count.")
             return
-        from pathlib import Path as _P
-        self.cal_label.setText(f"Calibration: {_P(path).name} ({wl.size} pts)")
+        self.cal_label.setText(breakable(f"Calibration: {Path(path).name} ({wl.size} pts)"))
+        self.cal_label.setToolTip(path)
         self._update_status("Calibration loaded.")
 
     def _clear_calibration(self) -> None:
@@ -876,7 +870,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
     def _set_connection_indicator(self, connected: bool, text: str) -> None:
         color = "#2ca02c" if connected else "#cc1f1f"
         self.status_dot.setStyleSheet(f"color: {color};")
-        self.conn_text.setText(text)
+        self.conn_text.setText(breakable(text))
         self._connected = connected
 
     def _set_device_controls_enabled(self, enabled: bool) -> None:
@@ -1005,6 +999,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Cannot start", miss)
             return
 
+        if not self._confirm_device_limits(settings):
+            return
+
         mismatch = self._integration_mismatch(settings.single_time_ms)
         if mismatch:
             reply = QtWidgets.QMessageBox.question(
@@ -1023,23 +1020,21 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                 return
 
         try:
-            self.run_dir = storage.run_directory(name, save_dir=self._save_dir)
+            run_dir = storage.run_directory(name, save_dir=self._save_dir)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Cannot create folder", str(exc))
             return
 
-        self._run_name = storage.run_basename(name)
-        self._run_single_ms = settings.single_time_ms
+        self._run = _Run(name=storage.run_basename(name), run_dir=run_dir,
+                         mode=self.processor.mode, single_ms=settings.single_time_ms,
+                         excitation_nm=self.processor.excitation_nm,
+                         metadata=self._processing_metadata(settings))
+        self._wavelengths = self._scans = self._latest = None
+        self._buffer = self._stats = None
         self.progress.setMaximum(settings.integrations_count())
         self.progress.setValue(0)
-        self.current_header.setText("Current integration")
-        self.avg_header.setText("Average integration")
-        plotting.draw_placeholder(self.ax_current)
-        plotting.draw_placeholder(self.ax_avg)
-        self.canvas_current.draw()
-        self.canvas_avg.draw()
+        self._draw_placeholders()
 
-        self._run_mode = self.processor.mode
         self.worker = AcquisitionWorker(self.spec, settings, self.processor)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_finished)
@@ -1051,7 +1046,31 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.save_btn.setEnabled(False)
         self._set_device_controls_enabled(False)
         self._set_busy_controls(False)
-        self._update_status(f"Running -> {self.run_dir}")
+        self._update_status(f"Running -> {run_dir}")
+
+    def _confirm_device_limits(self, settings: AcquisitionSettings) -> bool:
+        """Ask before a run whose single integration time the device would clamp."""
+        requested = settings.single_time_ms
+        applied = self._clamp_ms(requested)
+        if abs(applied - requested) <= 1.0:
+            return True
+        lo, hi = self.spec.integration_limits_micros()
+        reply = QtWidgets.QMessageBox.question(
+            self, "Integration time out of range",
+            f"This spectrometer supports single integrations from "
+            f"{format_duration(lo / 1000.0)} to {format_duration(hi / 1000.0)}, so "
+            f"{format_duration(requested)} would run as {format_duration(applied)}."
+            "\n\nFor a longer exposure, keep the single integration within range and "
+            "take more integrations (or a longer total integration time)."
+            f"\n\nContinue with {format_duration(applied)} per integration?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return False
+        settings.single_time_ms = applied
+        self.single_time.set_milliseconds(applied, readable_unit=True)
+        self._sync_derived()
+        return True
 
     def _clamp_ms(self, ms: float) -> float:
         """The integration time the device would actually apply for ``ms``."""
@@ -1093,32 +1112,28 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.worker.abort()
         self._update_status("Interrupting after current integration...")
 
-    def _on_progress(self, index, total, wavelengths, intensities, avg, std) -> None:
+    def _on_progress(self, index, total, wavelengths, intensities) -> None:
+        n_pixels = np.size(wavelengths)
+        if self._buffer is None or self._buffer.shape != (total, n_pixels):
+            self._buffer = np.empty((total, n_pixels), dtype=float)
+        self._buffer[index - 1] = intensities
         self._wavelengths = wavelengths
-        self._average = avg
-        self._std = std
+        self._scans = self._buffer[:index]
+        self._latest = intensities
+        self._latest_index, self._latest_total = index, total
+        self._stats = None
         self.progress.setValue(index)
-        self.current_header.setText(f"Current integration  ({index}/{total})")
-        try:
-            plotting.draw_current(self.ax_current, self.processor.xvalues(wavelengths),
-                                  intensities, ylabel=self._ylabel(),
-                                  xlabel=self.processor.xlabel(),
-                                  y_from_zero=self._y_from_zero())
-            self.canvas_current.draw()
-            self._redraw_average()
-        except Exception as exc:
-            self._update_status(f"Plot update skipped: {exc}")
+        if not self._redraw_timer.isActive():
+            self._redraw_timer.start()
 
-    def _on_finished(self, wavelengths, all_intensities, avg, std) -> None:
+    def _on_finished(self, wavelengths, all_intensities) -> None:
         self.worker = None
+        self._redraw_timer.stop()
         self._wavelengths = wavelengths
-        self._all_intensities = all_intensities
-        self._average = avg
-        self._std = std
-        self._run_xvalues = self.processor.xvalues(wavelengths)
-        self._run_xlabel = self.processor.xlabel()
-        self._run_ylabel = MODE_YLABELS[self._run_mode]
-        self._run_y0 = self._run_mode is MeasurementMode.SCOPE
+        self._scans = all_intensities
+        self._latest = all_intensities[-1]
+        self._buffer = None
+        self._stats = None
 
         self.stop_btn.setEnabled(False)
         self.save_btn.setEnabled(True)
@@ -1126,16 +1141,15 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._set_busy_controls(True)
         self._refresh_start_enabled()
 
+        self._redraw_capture()
         try:
-            self._redraw_average()
-        except Exception as exc:
-            self._update_status(f"Plot update skipped: {exc}")
-        try:
-            self._autosave()
+            csv_path = self._write_outputs(with_uncertainty=False)
             self._update_status(
-                f"Done. {all_intensities.shape[0]} integrations saved to {self.run_dir}")
+                f"Done. {all_intensities.shape[0]} integrations saved to {self._run.run_dir}")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
+            return
+        self.view_page.notify_run_saved(csv_path)
 
     def _on_failed(self, message: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Acquisition failed", message)
@@ -1146,59 +1160,105 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._refresh_start_enabled()
         self._update_status("Acquisition failed.")
 
-    def _ylabel(self) -> str:
-        return MODE_YLABELS[self.processor.mode]
-
+    # ----- Capture plots ------------------------------------------------------
     def _y_from_zero(self) -> bool:
-        return self.processor.mode is MeasurementMode.SCOPE
+        return self._run.mode is MeasurementMode.SCOPE
 
-    def _xdata(self) -> np.ndarray:
-        """X-axis values for the current mode (wavelength, or Raman shift)."""
-        return self.processor.xvalues(self._wavelengths)
+    def _capture_axis(self):
+        """X values and intensity scaling for the run on screen, in the chosen unit."""
+        return spectral_axis(self._wavelengths, self.display.xunit, self._run.mode,
+                             self._run.excitation_nm)
 
-    def _draw_average_into(self, ax) -> None:
-        """Render the current average (live state) onto the given axes."""
-        plotting.draw_average(
-            ax, self._xdata(), self._average, self._std,
-            bars_1sigma=self.cb_bars1.isChecked(),
-            bars_2sigma=self.cb_bars2.isChecked(),
-            band_1sigma=self.cb_band1.isChecked(),
-            band_2sigma=self.cb_band2.isChecked(),
-            ylabel=self._ylabel(), xlabel=self.processor.xlabel(),
-            y_from_zero=self._y_from_zero(),
-        )
+    def _capture_units(self):
+        return available_units(self._run.mode, self._run.excitation_nm)
 
-    def _redraw_average(self) -> None:
-        if self._wavelengths is None or self._average is None:
-            return
-        self._draw_average_into(self.ax_avg)
-        self.canvas_avg.draw()
-        if self._fs_plot is not None:
-            self._fs_plot.render(self._draw_average_into)
+    def _capture_stats(self):
+        if self._stats is None:
+            self._stats = scan_statistics(self._scans, self.display.outlier_sigma)
+        return self._stats
 
-    def _redraw_current_and_average(self) -> None:
-        """Redraw both panels (e.g. after a mode/excitation change)."""
-        if self._wavelengths is None:
+    def _draw_placeholders(self) -> None:
+        """Example axes before data arrives, labelled for the selected mode."""
+        mode, excitation = self.processor.mode, self.processor.excitation_nm
+        axis = spectral_axis(np.array([400.0, 800.0]), self.display.xunit, mode, excitation)
+        for plot in (self.plot_current, self.plot_avg):
+            plotting.draw_placeholder(plot.ax, xlabel=axis.xlabel, ylabel=axis.ylabel)
+            plot.set_units(available_units(mode, excitation), axis.unit)
+            plot.finish_draw()
+        self.plot_current.set_title("Current integration")
+        self.plot_avg.set_title("Average integration")
+
+    def _redraw_capture(self) -> None:
+        """Redraw both Capture plots (placeholders until the first scan)."""
+        if self._scans is None:
+            self._draw_placeholders()
             return
         try:
-            self._redraw_average()
+            axis = self._capture_axis()
+            plotting.draw_current(self.plot_current.ax, axis.x, axis.apply(self._latest),
+                                  ylabel=axis.ylabel, xlabel=axis.xlabel,
+                                  y_from_zero=self._y_from_zero(),
+                                  gid=plotting.PROBE_GID + "current")
+            self.plot_current.set_title(
+                f"Current integration  ({self._latest_index}/{self._latest_total})")
+            self.plot_current.set_units(self._capture_units(), axis.unit)
+            self.plot_current.finish_draw()
+            self._draw_average_plot(axis)
         except Exception as exc:
             self._update_status(f"Plot update skipped: {exc}")
 
+    def _draw_average_into(self, ax, axis) -> None:
+        """Render the run average (with the enabled bars/bands) onto the given axes."""
+        stats = self._capture_stats()
+        plotting.draw_average(
+            ax, axis.x, axis.apply(stats.average), axis.apply(stats.std),
+            **self.uncertainty.flags(), ylabel=axis.ylabel, xlabel=axis.xlabel,
+            y_from_zero=self._y_from_zero(), gid=plotting.PROBE_GID + "average")
+
+    def _draw_average_plot(self, axis) -> None:
+        self._draw_average_into(self.plot_avg.ax, axis)
+        note = describe_outliers(self._capture_stats(), self._scans.shape[0])
+        self.plot_avg.set_title(f"Average integration  ·  {note}" if note
+                                else "Average integration")
+        self.plot_avg.set_units(self._capture_units(), axis.unit)
+        self.plot_avg.finish_draw()
+        if self._fs_plot is not None:
+            self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
+                                 self._capture_units(), axis.unit)
+
+    def _redraw_average(self) -> None:
+        if self._scans is None:
+            return
+        try:
+            self._draw_average_plot(self._capture_axis())
+        except Exception as exc:
+            self._update_status(f"Plot update skipped: {exc}")
+
+    def _on_xunit_changed(self, _unit) -> None:
+        self._redraw_capture()
+
+    def _on_outlier_changed(self, _sigma) -> None:
+        self._stats = None
+        self._redraw_average()
+
     def _open_fullscreen_average(self) -> None:
-        if self._average is None:
+        if self._scans is None:
             self._update_status("No average yet — run an acquisition first.")
             return
         if self._fs_plot is None:
             self._fs_plot = FullScreenPlot("Average integration", self)
             self._fs_plot.finished.connect(self._on_fullscreen_closed)
-        self._fs_plot.render(self._draw_average_into)
+            self._fs_plot.plot.unit_selected.connect(self.display.set_xunit)
+        axis = self._capture_axis()
+        self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
+                             self._capture_units(), axis.unit)
         self._fs_plot.showFullScreen()
         self._fs_plot.raise_()
 
     def _on_fullscreen_closed(self, *_) -> None:
         self._fs_plot = None
 
+    # ----- saving -------------------------------------------------------------
     @staticmethod
     def _save_paper_figure(draw, out_path: str) -> None:
         """Render a paper-quality figure (300 DPI) via the given draw callback."""
@@ -1207,66 +1267,70 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         draw(ax)
         fig.savefig(out_path, dpi=plotting.PAPER_DPI)
 
-    def _autosave(self) -> None:
-        assert self.run_dir is not None
-        base = self.run_dir / self._run_name
-        x = self._run_xvalues
-        alli = self._all_intensities
-        avg = self._average
-        std = self._std
-        ylabel, xlabel, y0 = self._run_ylabel, self._run_xlabel, self._run_y0
-
-        storage.save_csv(Path(f"{base}_data.csv"), self._run_single_ms,
-                         self._wavelengths, alli, avg, std, metadata=self._run_metadata())
-
-        self._save_paper_figure(
-            lambda ax: plotting.draw_average(ax, x, avg, std, ylabel=ylabel,
-                                             xlabel=xlabel, y_from_zero=y0),
-            f"{base}_total.png")
-        self._save_paper_figure(
-            lambda ax: plotting.draw_average(ax, x, avg, std, ylabel=ylabel,
-                                             xlabel=xlabel, y_from_zero=y0),
-            f"{base}_average.png")
-        self._save_paper_figure(
-            lambda ax: plotting.draw_overlay(ax, x, alli, avg, ylabel=ylabel,
-                                             xlabel=xlabel, y_from_zero=y0),
-            f"{base}_average_overlay.png")
-
-    def _run_metadata(self) -> dict:
-        """Header fields describing how the run was processed (for the CSV)."""
+    def _processing_metadata(self, settings: AcquisitionSettings) -> dict:
+        """How the run is processed, recorded in the CSV header (fixed at Start)."""
+        mode = self.processor.mode
         meta = {
-            "measurement_mode": MODE_LABELS[self._run_mode],
-            "quantity": MODE_YLABELS[self._run_mode],
-            "electric_dark_correction": self.cb_electric_dark.isChecked(),
-            "nonlinearity_correction": self.cb_nonlinearity.isChecked(),
+            "measurement_mode": MODE_LABELS[mode],
+            "quantity": MODE_YLABELS[mode],
+            "electric_dark_correction": settings.correct_dark_counts,
+            "nonlinearity_correction": settings.correct_nonlinearity,
             "boxcar_width": self.boxcar_width.value(),
             "dark_stored": self.processor.dark is not None,
             "reference_stored": self.processor.reference is not None,
         }
-        if self._run_mode is MeasurementMode.RAMAN:
+        if mode is MeasurementMode.RAMAN:
             meta["excitation_nm"] = self.excitation_nm.value()
-        if self._run_mode is MeasurementMode.IRRADIANCE:
+        if mode is MeasurementMode.IRRADIANCE:
             meta["collection_area_cm2"] = self.area_cm2.value()
             meta["calibration_loaded"] = self.processor.calibration is not None
+        meta["measurement_mode_id"] = mode.value
         return meta
 
-    def _save_total_with_uncertainty(self) -> None:
-        if self.run_dir is None or self._average is None:
-            return
-        base = self.run_dir / self._run_name
-        out = f"{base}_total_with_uncertainty.png"
+    def _write_outputs(self, with_uncertainty: bool) -> Path:
+        """Write the run's CSVs and figures with the current outlier filter and x-axis."""
+        run = self._run
+        base = run.run_dir / run.name
+        stats = self._capture_stats()
+        meta = dict(run.metadata)
+        meta["outlier_filter_sigma"] = (f"{stats.threshold_sigma:g}"
+                                        if stats.threshold_sigma else "off")
+        meta["outlier_values_removed"] = stats.n_removed
+
+        csv_path = Path(f"{base}_data.csv")
+        storage.save_csv(csv_path, run.single_ms, self._wavelengths, self._scans,
+                         stats.average, stats.std, metadata=meta)
+        storage.save_average_csv(Path(f"{base}_average.csv"), self._wavelengths,
+                                 stats.average, MODE_YLABELS[run.mode])
+
+        axis = self._capture_axis()
+        x, avg, std = axis.x, axis.apply(stats.average), axis.apply(stats.std)
+        alli = axis.apply(self._scans)
+        labels = dict(ylabel=axis.ylabel, xlabel=axis.xlabel, y_from_zero=self._y_from_zero())
         self._save_paper_figure(
-            lambda ax: plotting.draw_average(
-                ax, self._run_xvalues, self._average, self._std,
-                bars_1sigma=self.cb_bars1.isChecked(),
-                bars_2sigma=self.cb_bars2.isChecked(),
-                band_1sigma=self.cb_band1.isChecked(),
-                band_2sigma=self.cb_band2.isChecked(),
-                ylabel=self._run_ylabel, xlabel=self._run_xlabel, y_from_zero=self._run_y0,
-            ),
-            out,
-        )
-        self._update_status(f"Saved {out}")
+            lambda ax: plotting.draw_average(ax, x, avg, std, **labels), f"{base}_total.png")
+        self._save_paper_figure(
+            lambda ax: plotting.draw_average(ax, x, avg, std, **labels), f"{base}_average.png")
+        self._save_paper_figure(
+            lambda ax: plotting.draw_overlay(ax, x, alli, avg, **labels),
+            f"{base}_average_overlay.png")
+        if with_uncertainty:
+            self._save_paper_figure(
+                lambda ax: plotting.draw_average(ax, x, avg, std, **self.uncertainty.flags(),
+                                                 **labels),
+                f"{base}_total_with_uncertainty.png")
+        return csv_path
+
+    def _save_outputs(self) -> None:
+        if self._run is None or self._scans is None or self._busy():
+            return
+        try:
+            csv_path = self._write_outputs(with_uncertainty=True)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
+            return
+        self.view_page.notify_run_saved(csv_path)
+        self._update_status(f"Saved outputs (current settings) to {self._run.run_dir}")
 
     def _show_help(self) -> None:
         dlg = QtWidgets.QDialog(self)
