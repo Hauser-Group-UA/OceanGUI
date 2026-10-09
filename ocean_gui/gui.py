@@ -15,7 +15,7 @@ from .processing import (MODE_LABELS, MODE_YLABELS, MeasurementMode, Processor,
                          requires_calibration, requires_dark, requires_excitation,
                          requires_reference, scan_statistics)
 from .spectrometer import SpectrometerError, SpectrometerInterface, backend_status
-from .units import XUnit, available_units, spectral_axis
+from .units import EXAMPLE_WAVELENGTHS, XUnit, available_units, spectral_axis
 from .view_mode import ViewPage
 from .widgets import (DisplaySettings, FullScreenPlot, SidePanel, SpectrumPlot,
                       TimeField, UncertaintyBox, breakable, describe_outliers,
@@ -132,8 +132,12 @@ screen</b>; press <b>Esc</b> to exit.</p>
     µW/cm²/eV, and ratios (absorbance, %T, %R) are not rescaled.</li>
 <li><b>Reading values</b> - hover over a plot to see the value under the
     cursor below it. <b>Click</b> to mark the nearest data point with its
-    (x, y) value; <b>right-click</b> clears the mark. During a run the mark
-    stays at the same x and follows the live data.</li>
+    (x, y) value; <b>right-click</b> clears the mark. The mark stays on the same
+    data point through live updates and unit changes, so switching to energy
+    shows where that point moves (the axis runs the other way: long wavelengths
+    become low energies on the left).</li>
+<li>Clicks on a plot are ignored for a moment while it re-renders after a unit
+    change.</li>
 </ul>
 
 <h3>9. Outlier filtering</h3>
@@ -156,8 +160,9 @@ values were removed.</p>
 <ul>
 <li><code>*_data.csv</code> - integration time, wavelengths, every integration,
     and the outlier-filtered average and std (the header records the filter).</li>
-<li><code>*_average.csv</code> - just two columns, wavelength and average, ready
-    to open in Excel.</li>
+<li><code>*_average_3sigma.csv</code> and <code>*_average_unfiltered.csv</code> -
+    just two columns, wavelength and average (3σ outlier filter, and no
+    filter), ready to open in Excel.</li>
 <li><code>*_total.png</code> - picture of the total/average integration.</li>
 <li><code>*_average.png</code> - average integration, no bars/bands.</li>
 <li><code>*_average_overlay.png</code> - average in red over each individual
@@ -167,7 +172,11 @@ values were removed.</p>
 current outlier filter and x-axis, and also saves
 <code>*_total_with_uncertainty.png</code> with the bars/bands enabled on the
 Display tab. Every individual scan is always kept, so nothing is lost by
-re-saving.</p>
+re-saving. Figures are saved at 600 DPI.</p>
+<p><b>Export data…</b> on the Display tab saves the average as a two-column
+CSV with the <i>current</i> outlier filter, in the plot's x-axis units (on an
+energy axis that is energy with the renormalised intensity, sorted by
+energy).</p>
 
 <h3>11. View mode</h3>
 <p>Shows one saved run: the left plot is a single scan, the right plot the run
@@ -180,16 +189,22 @@ type a scan number and press Enter to jump straight to it.</p>
 <h3>12. Compare mode</h3>
 <p><b>Add files…</b> to overlay the <i>average</i> of each run. The list order
 is the drawing order - the top entry is drawn on top; use ▲ / ▼ to reorder and
-✕ to remove. To stay responsive with many files, changes (files, order, units,
+✕ to remove. Untick a run's box to hide it without removing it from the
+list. To stay responsive with many files, changes (files, order, units,
 filter, bars/bands, legend) are only drawn when you press <b>Redraw plot</b> - a
 yellow banner shows when changes are waiting. Lines use four colour-blind-safe
 colours; after four, the line style changes (dashed, dotted, dash-dot). Each run
 keeps its colour when the list is reordered. Toggle the legend with <b>Show
 legend</b>; click the legend on the plot (or <b>Edit labels…</b>) to rename the
-entries. <b>Save figure…</b> writes the comparison at 300 DPI.</p>
+entries. <b>Save figure…</b> writes the comparison at 600 DPI. <b>Export
+data…</b> writes a CSV with the x-axis in its first column and one column per
+ticked run (averages with the current outlier filter, in the plot's x-axis
+units); runs measured on a different wavelength grid are interpolated onto the
+first ticked run's grid.</p>
 """
 
 MODE_NAMES = ("Capture", "View", "Compare")
+AUTOSAVE_SIGMAS = (3.0, 0.0)
 
 
 @dataclass
@@ -336,8 +351,25 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                                  self._group_corrections()]), "Processing")
         self.uncertainty = UncertaintyBox()
         self.uncertainty.changed.connect(self._redraw_average)
-        tabs.addTab(scroll_page([outlier_group(self.display), self.uncertainty]), "Display")
+        tabs.addTab(scroll_page([outlier_group(self.display), self.uncertainty,
+                                 self._group_export()]), "Display")
         return tabs
+
+    def _group_export(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Export")
+        v = QtWidgets.QVBoxLayout(box)
+        self.export_btn = QtWidgets.QPushButton("Export data…")
+        self.export_btn.setToolTip("Save the run average as a two-column CSV with the "
+                                   "current outlier filter, in the plot's x-axis units")
+        self.export_btn.clicked.connect(self._export_data)
+        self.export_btn.setEnabled(False)
+        hint = QtWidgets.QLabel("Average with the current outlier filter, in the "
+                                "plot's x-axis units.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(self.export_btn)
+        v.addWidget(hint)
+        return box
 
     def _group_device(self) -> QtWidgets.QGroupBox:
         conn_box = QtWidgets.QGroupBox("Device")
@@ -1034,6 +1066,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self._set_device_controls_enabled(False)
         self._set_busy_controls(False)
         self._update_status(f"Running -> {run_dir}")
@@ -1103,13 +1136,14 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
         self.stop_btn.setEnabled(False)
         self.save_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
         self._set_device_controls_enabled(True)
         self._set_busy_controls(True)
         self._refresh_start_enabled()
 
         self._redraw_capture()
         try:
-            csv_path = self._write_outputs(with_uncertainty=False)
+            csv_path = self._write_outputs_busy(with_uncertainty=False)
             self._update_status(
                 f"Done. {all_intensities.shape[0]} integrations saved to {self._run.run_dir}")
         except Exception as exc:
@@ -1145,9 +1179,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
     def _draw_placeholders(self) -> None:
         """Example axes before data arrives, labelled for the selected mode."""
         mode, excitation = self.processor.mode, self.processor.excitation_nm
-        axis = spectral_axis(np.array([400.0, 800.0]), self.display.xunit, mode, excitation)
+        axis = spectral_axis(EXAMPLE_WAVELENGTHS, self.display.xunit, mode, excitation)
         for plot in (self.plot_current, self.plot_avg):
-            plotting.draw_placeholder(plot.ax, xlabel=axis.xlabel, ylabel=axis.ylabel)
+            plotting.draw_placeholder(plot.ax, x=axis.x, xlabel=axis.xlabel, ylabel=axis.ylabel)
             plot.set_units(available_units(mode, excitation), axis.unit)
             plot.finish_draw()
         self.plot_current.set_title("Current integration")
@@ -1200,6 +1234,11 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             self._update_status(f"Plot update skipped: {exc}")
 
     def _on_xunit_changed(self, _unit) -> None:
+        plots = [self.plot_current, self.plot_avg]
+        if self._fs_plot is not None:
+            plots.append(self._fs_plot.plot)
+        for plot in plots:
+            plot.hold_input()
         self._redraw_capture()
 
     def _on_outlier_changed(self, _sigma) -> None:
@@ -1225,7 +1264,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
     @staticmethod
     def _save_paper_figure(draw, out_path: str) -> None:
-        """Render a paper-quality figure (300 DPI) via the given draw callback."""
+        """Render a paper-quality figure (600 DPI) via the given draw callback."""
         fig = Figure(figsize=plotting.PAPER_FIGSIZE, tight_layout=True)
         ax = fig.add_subplot(111)
         draw(ax)
@@ -1264,8 +1303,12 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         csv_path = Path(f"{base}_data.csv")
         storage.save_csv(csv_path, run.single_ms, self._wavelengths, self._scans,
                          stats.average, stats.std, metadata=meta)
-        storage.save_average_csv(Path(f"{base}_average.csv"), self._wavelengths,
-                                 stats.average, MODE_YLABELS[run.mode])
+        for sigma in AUTOSAVE_SIGMAS:
+            average = (stats.average if sigma == stats.threshold_sigma
+                       else scan_statistics(self._scans, sigma).average)
+            storage.save_average_csv(
+                Path(f"{base}_average_{storage.threshold_tag(sigma)}.csv"),
+                self._wavelengths, average, MODE_YLABELS[run.mode])
 
         axis = self._capture_axis()
         x, avg, std = axis.x, axis.apply(stats.average), axis.apply(stats.std)
@@ -1285,11 +1328,45 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                 f"{base}_total_with_uncertainty.png")
         return csv_path
 
+    def _write_outputs_busy(self, with_uncertainty: bool) -> Path:
+        """_write_outputs with a wait cursor and status message (large runs take seconds)."""
+        self._update_status("Saving outputs…")
+        self.statusBar().repaint()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            return self._write_outputs(with_uncertainty)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _export_data(self) -> None:
+        if self._run is None or self._scans is None or self._busy():
+            return
+        axis = self._capture_axis()
+        stats = self._capture_stats()
+        suffix = "" if axis.unit is XUnit.WAVELENGTH else f"_{axis.unit.value}"
+        start = (self._run.run_dir /
+                 f"{self._run.name}_average_{storage.threshold_tag(stats.threshold_sigma)}{suffix}.csv")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export data", str(start), "CSV files (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        order = np.argsort(axis.x)
+        try:
+            storage.save_columns_csv(
+                path, [axis.xlabel, storage.average_header(axis.ylabel)],
+                [axis.x[order], axis.apply(stats.average)[order]])
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self._update_status(f"Exported {path}")
+
     def _save_outputs(self) -> None:
         if self._run is None or self._scans is None or self._busy():
             return
         try:
-            csv_path = self._write_outputs(with_uncertainty=True)
+            csv_path = self._write_outputs_busy(with_uncertainty=True)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return

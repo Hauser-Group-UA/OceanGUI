@@ -6,8 +6,8 @@ GREY = "#9a9a9a"
 BAND_1 = "#cc1f1f"
 BAND_2 = "#f0a0a0"
 
-PAPER_FIGSIZE = (6.0, 4.5)   # inches
-PAPER_DPI = 300
+PAPER_FIGSIZE = (6.0, 4.5)
+PAPER_DPI = 600
 LABEL_FONTSIZE = 15
 TICK_FONTSIZE = 12
 LEGEND_FONTSIZE = 11
@@ -56,10 +56,11 @@ def style_axes(ax, wavelengths=None, *, y_from_zero: bool = False,
 
 
 def draw_placeholder(ax, message: str = "Awaiting acquisition\n(example axes)", *,
-                     xlabel: str = XLABEL, ylabel: str = YLABEL) -> None:
+                     x=None, xlabel: str = XLABEL, ylabel: str = YLABEL) -> None:
     """Draw example dummy axes shown before any real data exists."""
-    x = np.linspace(0, 10, 200)
-    y = np.sin(x) * np.exp(-0.1 * x)
+    t = np.linspace(0, 10, 200 if x is None else np.size(x))
+    x = t if x is None else np.asarray(x, dtype=float)
+    y = np.sin(t) * np.exp(-0.1 * t)
     ax.clear()
     ax.plot(x, y, color=GREY, linestyle="--", linewidth=1.0)
     ax.text(0.5, 0.5, message,

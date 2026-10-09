@@ -46,8 +46,8 @@ class AcquisitionWorker(QtCore.QThread):
     """Collect processed scans. Averaging (with outlier filtering) is done by
     the GUI, so the filter can be changed while the run is in progress."""
 
-    progress = QtCore.pyqtSignal(int, int, object, object)  # count, total, wl, scan
-    finished_ok = QtCore.pyqtSignal(object, object)         # wl, all scans
+    progress = QtCore.pyqtSignal(int, int, object, object)
+    finished_ok = QtCore.pyqtSignal(object, object)
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, spec: SpectrometerInterface, settings: AcquisitionSettings,

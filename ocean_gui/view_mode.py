@@ -6,7 +6,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from . import plotting, storage
 from .processing import MODE_LABELS, MeasurementMode, scan_statistics
-from .units import available_units, spectral_axis
+from .units import EXAMPLE_WAVELENGTHS, available_units, spectral_axis
 from .widgets import (DisplaySettings, ElidedLabel, FullScreenPlot, SidePanel,
                       SpectrumPlot, UncertaintyBox, breakable, describe_outliers,
                       outlier_group, scroll_page)
@@ -41,7 +41,7 @@ class ViewPage(QtWidgets.QWidget):
         layout.addWidget(panel, 0)
         layout.addWidget(self._build_plots(), 1)
 
-        display.xunit_changed.connect(lambda *_: self._redraw())
+        display.xunit_changed.connect(self._on_xunit_changed)
         display.outlier_changed.connect(self._on_outlier_changed)
         self._show_empty("Open a saved run (…_data.csv)")
 
@@ -247,10 +247,19 @@ class ViewPage(QtWidgets.QWidget):
     def _y_from_zero(self) -> bool:
         return self._run.mode is MeasurementMode.SCOPE
 
+    def _on_xunit_changed(self, _unit) -> None:
+        plots = [self.plot_scan, self.plot_avg]
+        if self._fs_plot is not None:
+            plots.append(self._fs_plot.plot)
+        for plot in plots:
+            plot.hold_input()
+        self._redraw()
+
     def _show_empty(self, message: str) -> None:
-        axis = spectral_axis(np.array([400.0, 800.0]), self.display.xunit)
+        axis = spectral_axis(EXAMPLE_WAVELENGTHS, self.display.xunit)
         for plot in (self.plot_scan, self.plot_avg):
-            plotting.draw_placeholder(plot.ax, message, xlabel=axis.xlabel, ylabel=axis.ylabel)
+            plotting.draw_placeholder(plot.ax, message, x=axis.x,
+                                      xlabel=axis.xlabel, ylabel=axis.ylabel)
             plot.set_units(available_units(None, None), axis.unit)
             plot.finish_draw()
 

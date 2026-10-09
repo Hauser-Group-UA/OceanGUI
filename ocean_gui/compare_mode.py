@@ -8,7 +8,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import plotting, storage
 from .processing import MeasurementMode, ScanStats, scan_statistics
-from .units import XUnit, available_units, spectral_axis
+from .units import EXAMPLE_WAVELENGTHS, XUnit, available_units, spectral_axis
 from .widgets import (DisplaySettings, ElidedLabel, PanelScrollArea, SidePanel,
                       SpectrumPlot, UncertaintyBox, outlier_group)
 
@@ -26,6 +26,7 @@ class CompareItem:
     run: storage.RunData
     label: str
     style: int
+    included: bool = True
     _cache: Dict[float, ScanStats] = field(default_factory=dict)
 
     def stats(self, threshold: float) -> ScanStats:
@@ -192,10 +193,17 @@ class ComparePage(QtWidgets.QWidget):
         self.redraw_btn.setToolTip("Draw the plot with the current runs and settings")
         self.redraw_btn.clicked.connect(self._redraw)
         save_btn = QtWidgets.QPushButton("Save figure…")
-        save_btn.setToolTip("Save the comparison at paper quality (300 DPI)")
+        save_btn.setToolTip("Save the comparison at paper quality (600 DPI)")
         save_btn.clicked.connect(self._save_figure)
+        export_btn = QtWidgets.QPushButton("Export data…")
+        export_btn.setToolTip("CSV with the x-axis and one column per ticked run "
+                              "(averages with the current outlier filter)")
+        export_btn.clicked.connect(self._export_data)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(save_btn)
+        row.addWidget(export_btn)
         lay.addWidget(self.redraw_btn)
-        lay.addWidget(save_btn)
+        lay.addLayout(row)
         return bar
 
     def _build_plot(self) -> QtWidgets.QWidget:
@@ -237,8 +245,15 @@ class ComparePage(QtWidgets.QWidget):
             swatch.setPixmap(_swatch(item.style, ratio))
             name = ElidedLabel(item.run.display_name)
             name.setToolTip(str(item.run.path))
+            name.setEnabled(item.included)
+            include = QtWidgets.QCheckBox()
+            include.setChecked(item.included)
+            include.setToolTip("Show this run in the plot (unticked runs stay in the list)")
+            include.toggled.connect(
+                lambda on, it=item, label=name: self._set_included(it, label, on))
             h.addWidget(swatch, 0)
             h.addWidget(name, 1)
+            h.addWidget(include, 0)
             for text, tip, slot, enabled in (
                     ("▲", "Move up (drawn above the runs below)",
                      lambda checked=False, k=i: self._move(k, -1), i > 0),
@@ -253,6 +268,14 @@ class ComparePage(QtWidgets.QWidget):
                 h.addWidget(btn, 0)
             self.rows_layout.addWidget(row)
         self.rows_layout.addStretch(1)
+
+    def _included(self) -> List[CompareItem]:
+        return [item for item in self._items if item.included]
+
+    def _set_included(self, item: CompareItem, label: QtWidgets.QLabel, on: bool) -> None:
+        item.included = on
+        label.setEnabled(on)
+        self._mark_stale()
 
     def _free_style(self) -> int:
         used = {item.style for item in self._items}
@@ -326,10 +349,13 @@ class ComparePage(QtWidgets.QWidget):
             self.status_message.emit("Add runs first - there are no legend entries yet.")
             return
         dialog = LegendLabelsDialog(self._items, self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            for item, text in zip(self._items, dialog.labels()):
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        labels = dialog.labels()
+        if labels != [item.label for item in self._items]:
+            for item, text in zip(self._items, labels):
                 item.label = text
-            self._redraw()
+            self._mark_stale()
 
     def _mark_stale(self, *_) -> None:
         if not self._items:
@@ -348,9 +374,10 @@ class ComparePage(QtWidgets.QWidget):
         self.redraw_btn.setStyleSheet("")
 
     def _units(self) -> List[XUnit]:
-        if not self._items:
+        items = self._included()
+        if not items:
             return available_units(None, None)
-        sets = [available_units(item.run.mode, item.run.excitation_nm) for item in self._items]
+        sets = [available_units(item.run.mode, item.run.excitation_nm) for item in items]
         return [u for u in sets[0] if all(u in s for s in sets[1:])]
 
     def _unit(self, units: List[XUnit]) -> XUnit:
@@ -358,8 +385,9 @@ class ComparePage(QtWidgets.QWidget):
 
     def _render(self, ax, unit: XUnit) -> None:
         threshold = self.display.outlier_sigma
+        items = self._included()
         series, ylabels, xlabel = [], set(), ""
-        for item in self._items:
+        for item in items:
             stats = item.stats(threshold)
             axis = spectral_axis(item.run.wavelengths, unit, item.run.mode,
                                  item.run.excitation_nm, item.run.ylabel)
@@ -372,20 +400,26 @@ class ComparePage(QtWidgets.QWidget):
         plotting.draw_compare(
             ax, series, **self.uncertainty.flags(), legend=self.legend_cb.isChecked(),
             ylabel=ylabels.pop() if len(ylabels) == 1 else _MIXED_YLABEL, xlabel=xlabel,
-            y_from_zero=all(i.run.mode is MeasurementMode.SCOPE for i in self._items))
+            y_from_zero=all(i.run.mode is MeasurementMode.SCOPE for i in items))
 
     def _redraw(self) -> None:
         units = self._units()
         unit = self._unit(units)
+        self.plot.hold_input()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            if self._items:
+            shown, total = len(self._included()), len(self._items)
+            if shown:
                 self._render(self.plot.ax, unit)
-                n = len(self._items)
-                self.plot.set_title(f"Average of each run  ({n} run{'s' if n != 1 else ''})")
+                count = f"{shown} run{'s' if shown != 1 else ''}"
+                if shown < total:
+                    count = f"{shown} of {total} runs"
+                self.plot.set_title(f"Average of each run  ({count})")
             else:
-                axis = spectral_axis(np.array([400.0, 800.0]), unit)
-                plotting.draw_placeholder(self.plot.ax, "Add saved runs to compare their averages",
+                axis = spectral_axis(EXAMPLE_WAVELENGTHS, unit)
+                message = ("Tick a run in the list to show it" if total
+                           else "Add saved runs to compare their averages")
+                plotting.draw_placeholder(self.plot.ax, message, x=axis.x,
                                           xlabel=axis.xlabel, ylabel=axis.ylabel)
                 self.plot.set_title("Compare run averages")
             self.plot.set_units(units, unit)
@@ -397,8 +431,8 @@ class ComparePage(QtWidgets.QWidget):
             QtWidgets.QApplication.restoreOverrideCursor()
 
     def _save_figure(self) -> None:
-        if not self._items:
-            self.status_message.emit("Add runs first - there is nothing to save yet.")
+        if not self._included():
+            self.status_message.emit("Tick at least one run - there is nothing to save yet.")
             return
         start = Path(self._last_dir or self._save_dir()) / "comparison.png"
         path, chosen = QtWidgets.QFileDialog.getSaveFileName(
@@ -417,3 +451,45 @@ class ComparePage(QtWidgets.QWidget):
             return
         self._redraw()
         self.status_message.emit(f"Saved {path}")
+
+    def _export_data(self) -> None:
+        items = self._included()
+        if not items:
+            self.status_message.emit("Tick at least one run - there is nothing to export yet.")
+            return
+        start = Path(self._last_dir or self._save_dir()) / "comparison.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export data", str(start), "CSV files (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        unit = self._unit(self._units())
+        threshold = self.display.outlier_sigma
+        ref = items[0]
+        ref_axis = spectral_axis(ref.run.wavelengths, unit, ref.run.mode,
+                                 ref.run.excitation_nm, ref.run.ylabel)
+        order = np.argsort(ref_axis.x)
+        x = ref_axis.x[order]
+        headers, columns, interpolated = [ref_axis.xlabel], [x], 0
+        for item in items:
+            axis = spectral_axis(item.run.wavelengths, unit, item.run.mode,
+                                 item.run.excitation_nm, item.run.ylabel)
+            y = axis.apply(item.stats(threshold).average)
+            if np.array_equal(item.run.wavelengths, ref.run.wavelengths):
+                column = y[order]
+            else:
+                src = np.argsort(axis.x)
+                column = np.interp(x, axis.x[src], y[src], left=np.nan, right=np.nan)
+                interpolated += 1
+            headers.append(item.label)
+            columns.append(column)
+        try:
+            storage.save_columns_csv(path, headers, columns)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        note = (f"; {interpolated} interpolated onto {ref.label}'s wavelength grid"
+                if interpolated else "")
+        self.status_message.emit(f"Exported {len(items)} run{'s' if len(items) != 1 else ''} "
+                                 f"to {path}{note}")

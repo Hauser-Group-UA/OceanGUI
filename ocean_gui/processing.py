@@ -238,7 +238,7 @@ def scan_statistics(scans, threshold_sigma: float = 0.0) -> ScanStats:
     all_finite = bool(finite.all())
 
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN pixels, 0/0
+        warnings.simplefilter("ignore", RuntimeWarning)
         if threshold_sigma and x.shape[0] >= 3:
             data = x if all_finite else np.where(finite, x, np.nan)
             median = np.median if all_finite else np.nanmedian
@@ -251,7 +251,7 @@ def scan_statistics(scans, threshold_sigma: float = 0.0) -> ScanStats:
                 factor = threshold_factor(x.shape[0], threshold_sigma)
             else:
                 n_valid = finite.sum(axis=0)
-                factor = np.full(n_valid.shape, np.inf)  # < 3 values: never filter
+                factor = np.full(n_valid.shape, np.inf)
                 for n in np.unique(n_valid[n_valid >= 3]):
                     factor[n_valid == n] = threshold_factor(int(n), threshold_sigma)
             keep &= ~(dev > threshold_sigma * factor * sigma)

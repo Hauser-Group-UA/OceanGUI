@@ -195,7 +195,7 @@ class PanelScrollArea(QtWidgets.QScrollArea):
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.widget() and event.type() == QtCore.QEvent.LayoutRequest:
-            self.updateGeometry()  # the content's minimum width may have changed
+            self.updateGeometry()
         return super().eventFilter(obj, event)
 
 
@@ -348,7 +348,7 @@ class SpectrumPlot(QtWidgets.QWidget):
     legend_clicked = QtCore.pyqtSignal()
     double_clicked = QtCore.pyqtSignal()
 
-    HINT = "Click to read a value  ·  click the x-axis label to change units"
+    HINT = "Click to read a value  ·  click the x-axis label for units"
 
     def __init__(self, title: Optional[str] = "", header_widget=None, parent=None) -> None:
         super().__init__(parent)
@@ -380,7 +380,7 @@ class SpectrumPlot(QtWidgets.QWidget):
 
         self.readout = ElidedLabel(self.HINT)
         self.readout.setAlignment(QtCore.Qt.AlignCenter)
-        self.readout.setStyleSheet("color: #555555; font-size: 11px;")
+        self.readout.setStyleSheet("color: #333333; font-size: 14px;")
         lay.addWidget(self.readout, 0)
 
         self.legend_editable = False
@@ -390,9 +390,15 @@ class SpectrumPlot(QtWidgets.QWidget):
         self._pin_artists = []
         self._hovering = False
         self._hand = False
+        self._held = False
+        self._hold_timer = QtCore.QTimer(self, singleShot=True, interval=3000)
+        self._hold_timer.timeout.connect(self._release_input)
+        self._release_timer = QtCore.QTimer(self, singleShot=True, interval=150)
+        self._release_timer.timeout.connect(self._release_input)
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.canvas.mpl_connect("figure_leave_event", self._on_leave)
+        self.canvas.mpl_connect("draw_event", self._on_drawn)
 
     def set_title(self, text: str) -> None:
         self.title.setText(text)
@@ -400,10 +406,36 @@ class SpectrumPlot(QtWidgets.QWidget):
 
     def set_units(self, available, current: XUnit) -> None:
         """Units offered by the x-axis-label menu, and the one being shown."""
-        if current is not self._unit:
-            self._pin = None
         self._units = tuple(available)
         self._unit = current
+
+    def hold_input(self) -> None:
+        """Ignore clicks until the plot has finished re-rendering."""
+        if not self.isVisible():
+            return
+        self._hold_timer.start()
+        if self._held:
+            return
+        self._held = True
+        self.canvas.setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+    def _on_drawn(self, _event) -> None:
+        if self._held:
+            self._release_timer.start()
+
+    def _release_input(self) -> None:
+        self._hold_timer.stop()
+        self._release_timer.stop()
+        if not self._held:
+            return
+        self._held = False
+        self.canvas.setEnabled(True)
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+    def hideEvent(self, event) -> None:
+        self._release_input()
+        super().hideEvent(event)
 
     def finish_draw(self) -> None:
         """Call after drawing onto ``ax``: restores the marked point and repaints."""
@@ -486,14 +518,13 @@ class SpectrumPlot(QtWidgets.QWidget):
         self._pin_text = ""
         if self._pin is None:
             return
-        gid, x0 = self._pin
+        gid, i = self._pin
         targets = self._targets()
         line = next((t for t in targets if t.get_gid() == gid), None)
         if line is None:
             return
         x, y = self._xy(line)
-        i = self._nearest_index(x, x0)
-        if i is None or not np.isfinite(y[i]):
+        if not 0 <= i < x.size or not np.isfinite(x[i]) or not np.isfinite(y[i]):
             return
         xi, yi = float(x[i]), float(y[i])
         self._pin_text = self._describe(line, xi, yi, with_name=len(targets) > 1)
@@ -607,7 +638,7 @@ class SpectrumPlot(QtWidgets.QWidget):
         if hit is None:
             return
         line, i = hit
-        self._pin = (line.get_gid(), float(self._xy(line)[0][i]))
+        self._pin = (line.get_gid(), int(i))
         self._remove_pin_artists()
         self._place_pin()
         self.canvas.draw_idle()

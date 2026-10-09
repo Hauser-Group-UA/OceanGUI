@@ -17,9 +17,11 @@ If no spectrometer (or backend) is present, the app automatically runs in
     scan number) next to the run average. It follows the most recent run
     until you open a specific file;
   - **Compare** - overlay the averages of several saved runs, in a reorderable
-    list (top = drawn on top) with colour-blind-safe colours that switch to
-    dashed/dotted lines after four, an optional clickable legend with editable
-    labels, and a **Redraw plot** button so large comparisons stay responsive.
+    list (top = drawn on top; untick a run to hide it without removing it) with
+    colour-blind-safe colours that switch to dashed/dotted lines after four, an
+    optional clickable legend with editable labels, a **Redraw plot** button so
+    large comparisons stay responsive, and **Export data…** to a CSV with one
+    column per ticked run.
 - **Wavelength / energy x-axis**: click any plot's x-axis label to switch
   between wavelength (nm) and energy (eV) (and Raman shift for Raman data).
   Intensities are converted with the Jacobian λ²/hc so peak shapes and areas
@@ -51,7 +53,7 @@ If no spectrometer (or backend) is present, the app automatically runs in
   average integration (right).
 - **Paper-quality figures**: descriptive axis labels with units and *no* plot
   title, inward tick marks on all four sides, data drawn edge-to-edge so ticks
-  reach the borders, and **300 DPI** output with a publication-friendly
+  reach the borders, and **600 DPI** output with a publication-friendly
   font-to-figure ratio.
 - **Placeholder axes**: example dummy axes are shown until real data arrives.
 - **Two run modes** (mutually exclusive):
@@ -64,8 +66,9 @@ If no spectrometer (or backend) is present, the app automatically runs in
 - **Automatic outputs** on completion (into `saved_data/<name>_<timestamp>/`):
   - `*_data.csv` — single integration time, wavelengths, every integration
     and the outlier-filtered average/std.
-  - `*_average.csv` — two columns (wavelength, average) that open directly in
-    Excel.
+  - `*_average_3sigma.csv` and `*_average_unfiltered.csv` — two columns
+    (wavelength, average) with the 3σ outlier filter and with no filter, that
+    open directly in Excel.
   - `*_total.png` — picture of the total/average integration.
   - `*_average.png` — average integration, no bars/bands.
   - `*_average_overlay.png` — average in **red** over each individual
@@ -73,6 +76,8 @@ If no spectrometer (or backend) is present, the app automatically runs in
 - **Save outputs (current settings)** button — re-writes the run's files with
   the current outlier filter and x-axis, plus the average plot with the
   currently-enabled uncertainty overlays.
+- **Export data…** (Display tab) — the run average with the current outlier
+  filter as a two-column CSV, in the plot's x-axis units.
 - **Interrupt** button — stops an in-progress run after an *"Are you sure?"*
   confirmation; integrations collected so far are still saved.
 - **In-app Help menu** (also `F1`).

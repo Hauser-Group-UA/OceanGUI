@@ -42,6 +42,8 @@ _DECIMALS = {XUnit.WAVELENGTH: 2, XUnit.ENERGY: 4, XUnit.RAMAN: 1}
 _RATIO_MODES = (MeasurementMode.ABSORBANCE, MeasurementMode.TRANSMITTANCE,
                 MeasurementMode.REFLECTANCE)
 
+EXAMPLE_WAVELENGTHS = np.linspace(400.0, 800.0, 200)
+
 
 @dataclass
 class SpectralAxis:

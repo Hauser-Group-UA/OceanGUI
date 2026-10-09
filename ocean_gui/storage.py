@@ -96,19 +96,39 @@ def save_csv(
     return path
 
 
-def save_average_csv(path: Path, wavelengths: np.ndarray, average: np.ndarray,
-                     ylabel: str = "Intensity (counts)") -> Path:
-    """Write a plain two-column file (wavelength, average) that opens in Excel.
+def threshold_tag(sigma: float) -> str:
+    """File-name tag for an outlier threshold: '3sigma', '2.5sigma' or 'unfiltered'."""
+    return f"{sigma:g}sigma" if sigma else "unfiltered"
 
-    One header row and no comment lines; the UTF-8 byte-order mark makes Excel
-    show units such as µ and ² correctly.
+
+def average_header(ylabel: str) -> str:
+    """'Intensity (counts)' -> 'Average intensity (counts)'."""
+    return f"Average {ylabel[:1].lower()}{ylabel[1:]}"
+
+
+def save_columns_csv(path, headers, columns) -> Path:
+    """Write columns under one header row, ready to open in Excel.
+
+    No comment lines; the UTF-8 byte-order mark makes Excel show units such as
+    µ and ² correctly. Missing (NaN) values are left blank.
     """
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["Wavelength (nm)", f"Average {ylabel[:1].lower()}{ylabel[1:]}"])
-        for wl, value in zip(wavelengths, average):
-            writer.writerow([f"{wl:.4f}", f"{value:.6g}"])
-    return path
+        writer.writerow(headers)
+        for row in zip(*columns):
+            writer.writerow([_cell(v, ".8g" if k == 0 else ".6g") for k, v in enumerate(row)])
+    return Path(path)
+
+
+def _cell(value, fmt: str) -> str:
+    return format(value, fmt) if np.isfinite(value) else ""
+
+
+def save_average_csv(path: Path, wavelengths: np.ndarray, average: np.ndarray,
+                     ylabel: str = "Intensity (counts)") -> Path:
+    """Write a plain two-column file (wavelength, average) that opens in Excel."""
+    return save_columns_csv(path, ["Wavelength (nm)", average_header(ylabel)],
+                            [wavelengths, average])
 
 
 _RUN_FOLDER = re.compile(r"^(?P<name>.+)_(?P<stamp>\d{8}_\d{6})$")
@@ -120,9 +140,9 @@ class RunData:
 
     path: Path
     wavelengths: np.ndarray
-    scans: np.ndarray                       # one row per scan
+    scans: np.ndarray
     metadata: Dict[str, str] = field(default_factory=dict)
-    header_ylabel: Optional[str] = None     # from a two-column average file
+    header_ylabel: Optional[str] = None
 
     @property
     def n_scans(self) -> int:
@@ -208,7 +228,7 @@ def _read_text(path: Path) -> str:
 
 
 def load_run(path) -> RunData:
-    """Read a run's ``*_data.csv`` (or a two-column ``*_average.csv``)."""
+    """Read a run's ``*_data.csv`` (or a two-column average/export CSV)."""
     path = Path(path)
     lines = _read_text(path).splitlines()
     metadata: Dict[str, str] = {}
