@@ -1,15 +1,15 @@
 """X-axis units (wavelength / energy / Raman shift) and intensity conversion.
 
-Switching a spectrum from wavelength to energy is not just relabelling the
-axis: intensity is a density *per unit x*, so it must be multiplied by the
-Jacobian |dλ/dE| = λ²/hc to keep peak shapes and areas correct.
+By default an energy axis just re-plots the measured values. With the
+Jacobian option on, intensities (densities *per unit x*) are multiplied by
+|dλ/dE| = λ²/hc so peak shapes and areas are correct per unit energy:
 
 - Irradiance (µW/cm²/nm) is converted exactly to µW/cm²/eV.
 - Counts are per *pixel*; each pixel spans a different energy width, so they
   are divided by that width and renormalised so the total number of counts is
   unchanged (values mid-range stay about the same).
 - Ratios (absorbance, transmittance, reflectance) are dimensionless and are
-  only re-plotted, never rescaled.
+  never rescaled.
 - Raman shift follows the usual Raman convention: counts are not rescaled.
 """
 
@@ -71,15 +71,18 @@ def available_units(mode: Optional[MeasurementMode],
 
 def spectral_axis(wavelengths, unit: XUnit, mode: Optional[MeasurementMode] = None,
                   excitation_nm: Optional[float] = None,
-                  ylabel: Optional[str] = None) -> SpectralAxis:
+                  ylabel: Optional[str] = None, jacobian: bool = False) -> SpectralAxis:
     """Express a spectrum on ``unit``; falls back to wavelength if unavailable.
 
     ``ylabel`` defaults to the mode's label; unknown modes are treated as counts.
+    ``jacobian`` rescales intensities to per unit energy on an energy axis.
     """
     wl = np.asarray(wavelengths, dtype=float)
     ylabel = ylabel or MODE_YLABELS.get(mode, "Intensity (counts)")
     if unit is XUnit.ENERGY:
         wl = np.clip(wl, 1e-6, None)
+        if not jacobian:
+            return SpectralAxis(unit, HC_EV_NM / wl, 1.0, XUNIT_LABELS[unit], ylabel)
         return SpectralAxis(unit, HC_EV_NM / wl, _energy_jacobian(wl, mode),
                             XUNIT_LABELS[unit], _energy_ylabel(mode, ylabel))
     if unit is XUnit.RAMAN and unit in available_units(mode, excitation_nm):
@@ -116,3 +119,38 @@ def format_y(value: float, ylabel: str) -> str:
     unit = match.group(1).split(",")[0].strip() if match else ""
     sep = "" if unit == "%" else " "
     return f"{value:.5g}{sep}{unit}" if unit else f"{value:.5g}"
+
+
+@dataclass
+class Spectrum:
+    """The per-wavelength data behind a plotted line, for readouts in every unit."""
+
+    wavelengths: np.ndarray
+    values: np.ndarray
+    mode: Optional[MeasurementMode] = None
+    excitation_nm: Optional[float] = None
+    ylabel: Optional[str] = None
+
+    def describe(self, index: int, first: XUnit, jacobian: bool) -> List[str]:
+        """'(x, ..., y)' groups for one point, the ``first`` unit leading.
+
+        Units with the same intensity share a group, e.g. '(589.12 nm, 2.1046 eV,
+        1834 counts)'; with the Jacobian on, energy gets its own rescaled group.
+        """
+        units = available_units(self.mode, self.excitation_nm)
+        if first not in units:
+            first = XUnit.WAVELENGTH
+        groups = []
+        for unit in [first] + [u for u in units if u is not first]:
+            axis = spectral_axis(self.wavelengths, unit, self.mode, self.excitation_nm,
+                                 self.ylabel, jacobian)
+            scale = axis.scale if np.ndim(axis.scale) == 0 else axis.scale[index]
+            y = format_y(float(self.values[index]) * scale, axis.ylabel)
+            x = format_x(float(axis.x[index]), unit)
+            for xs, shared in groups:
+                if shared == y:
+                    xs.append(x)
+                    break
+            else:
+                groups.append(([x], y))
+        return [f"({', '.join(xs)}, {y})" for xs, y in groups]

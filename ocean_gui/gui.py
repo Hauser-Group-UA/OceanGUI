@@ -15,11 +15,12 @@ from .processing import (MODE_LABELS, MODE_YLABELS, MeasurementMode, Processor,
                          requires_calibration, requires_dark, requires_excitation,
                          requires_reference, scan_statistics)
 from .spectrometer import SpectrometerError, SpectrometerInterface, backend_status
-from .units import EXAMPLE_WAVELENGTHS, XUnit, available_units, spectral_axis
+from .units import (EXAMPLE_WAVELENGTHS, Spectrum, XUnit, available_units,
+                    spectral_axis)
 from .view_mode import ViewPage
 from .widgets import (DisplaySettings, FullScreenPlot, SidePanel, SpectrumPlot,
                       TimeField, UncertaintyBox, breakable, describe_outliers,
-                      outlier_group, scroll_page)
+                      options_group, scroll_page)
 
 HELP_TEXT = """\
 <h2>Ocean Spectrometer GUI - Help</h2>
@@ -125,19 +126,24 @@ screen</b>; press <b>Esc</b> to exit.</p>
 <ul>
 <li><b>X-axis units</b> - click the x-axis label (marked ▾) and pick
     <b>Wavelength (nm)</b> or <b>Energy (eV)</b> (plus <b>Raman shift</b> for
-    Raman data). The choice applies to every plot and to saved figures. On an
-    energy axis intensities are converted with the Jacobian
-    |dλ/dE| = λ²/hc so peak shapes and areas stay correct: counts are
-    renormalised so the total number of counts is unchanged, irradiance becomes
-    µW/cm²/eV, and ratios (absorbance, %T, %R) are not rescaled.</li>
+    Raman data). The choice applies to every plot and to saved figures. By
+    default an energy axis shows the measured values unchanged.</li>
+<li><b>Jacobian (λ²/hc)</b> - optional, Off by default, set next to the outlier
+    threshold. When On, intensities on an energy axis are converted from per
+    nm to per eV with |dλ/dE| = λ²/hc so peak shapes and areas are correct per
+    unit energy: counts are renormalised so the total number of counts is
+    unchanged, irradiance becomes µW/cm²/eV, and ratios (absorbance, %T, %R)
+    are not rescaled.</li>
 <li><b>Reading values</b> - hover over a plot to see the value under the
-    cursor below it. <b>Click</b> to mark the nearest data point with its
-    (x, y) value; <b>right-click</b> clears the mark. The mark stays on the same
-    data point through live updates and unit changes, so switching to energy
-    shows where that point moves (the axis runs the other way: long wavelengths
-    become low energies on the left).</li>
+    cursor below it. <b>Click</b> to mark the nearest data point; <b>right-click</b>
+    clears the mark. Both show the point in wavelength <i>and</i> energy (and
+    Raman shift for Raman data) whatever the x-axis, e.g.
+    (589.12 nm, 2.1046 eV, 1834 counts). With the Jacobian On, the energy is
+    shown with its own rescaled intensity, e.g.
+    (589.12 nm, 1834 counts) | (2.1046 eV, 1840 counts). The mark stays on the
+    same data point through live updates and unit changes.</li>
 <li>Clicks on a plot are ignored for a moment while it re-renders after a unit
-    change.</li>
+    or Jacobian change.</li>
 </ul>
 
 <h3>9. Outlier filtering</h3>
@@ -175,8 +181,7 @@ Display tab. Every individual scan is always kept, so nothing is lost by
 re-saving. Figures are saved at 600 DPI.</p>
 <p><b>Export data…</b> on the Display tab saves the average as a two-column
 CSV with the <i>current</i> outlier filter, in the plot's x-axis units (on an
-energy axis that is energy with the renormalised intensity, sorted by
-energy).</p>
+energy axis: sorted by energy, with the Jacobian applied if it is On).</p>
 
 <h3>11. View mode</h3>
 <p>Shows one saved run: the left plot is a single scan, the right plot the run
@@ -191,7 +196,7 @@ type a scan number and press Enter to jump straight to it.</p>
 is the drawing order - the top entry is drawn on top; use ▲ / ▼ to reorder and
 ✕ to remove. Untick a run's box to hide it without removing it from the
 list. To stay responsive with many files, changes (files, order, units,
-filter, bars/bands, legend) are only drawn when you press <b>Redraw plot</b> - a
+filter, Jacobian, bars/bands, legend) are only drawn when you press <b>Redraw plot</b> - a
 yellow banner shows when changes are waiting. Lines use four colour-blind-safe
 colours; after four, the line style changes (dashed, dotted, dash-dot). Each run
 keeps its colour when the list is reordered. Toggle the legend with <b>Show
@@ -255,7 +260,8 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._redraw_timer.timeout.connect(self._redraw_capture)
 
         self._build_ui()
-        self.display.xunit_changed.connect(self._on_xunit_changed)
+        self.display.xunit_changed.connect(self._on_axis_changed)
+        self.display.jacobian_changed.connect(self._on_axis_changed)
         self.display.outlier_changed.connect(self._on_outlier_changed)
         self._update_status(f"Backend: {backend_status()}")
         self._refresh_devices()
@@ -343,7 +349,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         tabs.setDocumentMode(True)
         tabs.addTab(scroll_page([self._group_device(),
                                  self._group_acquisition(),
-                                 outlier_group(self.display),
+                                 options_group(self.display),
                                  self._group_runname()]), "Acquire")
         tabs.addTab(scroll_page([self._group_mode(),
                                  self._group_background(),
@@ -351,7 +357,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                                  self._group_corrections()]), "Processing")
         self.uncertainty = UncertaintyBox()
         self.uncertainty.changed.connect(self._redraw_average)
-        tabs.addTab(scroll_page([outlier_group(self.display), self.uncertainty,
+        tabs.addTab(scroll_page([options_group(self.display), self.uncertainty,
                                  self._group_export()]), "Display")
         return tabs
 
@@ -1166,7 +1172,11 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
     def _capture_axis(self):
         """X values and intensity scaling for the run on screen, in the chosen unit."""
         return spectral_axis(self._wavelengths, self.display.xunit, self._run.mode,
-                             self._run.excitation_nm)
+                             self._run.excitation_nm, jacobian=self.display.jacobian)
+
+    def _capture_spectrum(self, values) -> Spectrum:
+        return Spectrum(self._wavelengths, values, self._run.mode,
+                        self._run.excitation_nm, MODE_YLABELS[self._run.mode])
 
     def _capture_units(self):
         return available_units(self._run.mode, self._run.excitation_nm)
@@ -1179,10 +1189,11 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
     def _draw_placeholders(self) -> None:
         """Example axes before data arrives, labelled for the selected mode."""
         mode, excitation = self.processor.mode, self.processor.excitation_nm
-        axis = spectral_axis(EXAMPLE_WAVELENGTHS, self.display.xunit, mode, excitation)
+        axis = spectral_axis(EXAMPLE_WAVELENGTHS, self.display.xunit, mode, excitation,
+                             jacobian=self.display.jacobian)
         for plot in (self.plot_current, self.plot_avg):
             plotting.draw_placeholder(plot.ax, x=axis.x, xlabel=axis.xlabel, ylabel=axis.ylabel)
-            plot.set_units(available_units(mode, excitation), axis.unit)
+            plot.set_units(available_units(mode, excitation), axis.unit, self.display.jacobian)
             plot.finish_draw()
         self.plot_current.set_title("Current integration")
         self.plot_avg.set_title("Average integration")
@@ -1200,7 +1211,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                                   gid=plotting.PROBE_GID + "current")
             self.plot_current.set_title(
                 f"Current integration  ({self._latest_index}/{self._latest_total})")
-            self.plot_current.set_units(self._capture_units(), axis.unit)
+            self.plot_current.set_units(self._capture_units(), axis.unit, self.display.jacobian)
+            self.plot_current.set_spectra(
+                {plotting.PROBE_GID + "current": self._capture_spectrum(self._latest)})
             self.plot_current.finish_draw()
             self._draw_average_plot(axis)
         except Exception as exc:
@@ -1219,11 +1232,15 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         note = describe_outliers(self._capture_stats(), self._scans.shape[0])
         self.plot_avg.set_title(f"Average integration  ·  {note}" if note
                                 else "Average integration")
-        self.plot_avg.set_units(self._capture_units(), axis.unit)
+        spectra = {plotting.PROBE_GID + "average":
+                   self._capture_spectrum(self._capture_stats().average)}
+        self.plot_avg.set_units(self._capture_units(), axis.unit, self.display.jacobian)
+        self.plot_avg.set_spectra(spectra)
         self.plot_avg.finish_draw()
         if self._fs_plot is not None:
             self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
-                                 self._capture_units(), axis.unit)
+                                 self._capture_units(), axis.unit, self.display.jacobian,
+                                 spectra)
 
     def _redraw_average(self) -> None:
         if self._scans is None:
@@ -1233,7 +1250,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         except Exception as exc:
             self._update_status(f"Plot update skipped: {exc}")
 
-    def _on_xunit_changed(self, _unit) -> None:
+    def _on_axis_changed(self, *_) -> None:
         plots = [self.plot_current, self.plot_avg]
         if self._fs_plot is not None:
             plots.append(self._fs_plot.plot)
@@ -1255,7 +1272,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             self._fs_plot.plot.unit_selected.connect(self.display.set_xunit)
         axis = self._capture_axis()
         self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
-                             self._capture_units(), axis.unit)
+                             self._capture_units(), axis.unit, self.display.jacobian,
+                             {plotting.PROBE_GID + "average":
+                              self._capture_spectrum(self._capture_stats().average)})
         self._fs_plot.showFullScreen()
         self._fs_plot.raise_()
 

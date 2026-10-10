@@ -8,9 +8,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import plotting, storage
 from .processing import MeasurementMode, ScanStats, scan_statistics
-from .units import EXAMPLE_WAVELENGTHS, XUnit, available_units, spectral_axis
+from .units import EXAMPLE_WAVELENGTHS, Spectrum, XUnit, available_units, spectral_axis
 from .widgets import (DisplaySettings, ElidedLabel, PanelScrollArea, SidePanel,
-                      SpectrumPlot, UncertaintyBox, outlier_group)
+                      SpectrumPlot, UncertaintyBox, options_group)
 
 _QT_PEN = {"-": QtCore.Qt.SolidLine, "--": QtCore.Qt.DashLine,
            ":": QtCore.Qt.DotLine, "-.": QtCore.Qt.DashDotLine}
@@ -130,7 +130,7 @@ class ComparePage(QtWidgets.QWidget):
         pl.setContentsMargins(4, 4, 4, 4)
         pl.setSpacing(6)
         pl.addWidget(self._group_files(), 1)
-        pl.addWidget(outlier_group(display), 0)
+        pl.addWidget(options_group(display), 0)
         self.uncertainty = UncertaintyBox("Uncertainty")
         self.uncertainty.changed.connect(self._mark_stale)
         pl.addWidget(self.uncertainty, 0)
@@ -145,6 +145,7 @@ class ComparePage(QtWidgets.QWidget):
 
         display.xunit_changed.connect(self._mark_stale)
         display.outlier_changed.connect(self._mark_stale)
+        display.jacobian_changed.connect(self._mark_stale)
         self._rebuild_rows()
         self._redraw()
 
@@ -383,24 +384,30 @@ class ComparePage(QtWidgets.QWidget):
     def _unit(self, units: List[XUnit]) -> XUnit:
         return self.display.xunit if self.display.xunit in units else XUnit.WAVELENGTH
 
-    def _render(self, ax, unit: XUnit) -> None:
+    def _render(self, ax, unit: XUnit) -> Dict[str, Spectrum]:
+        """Draw the ticked runs; returns the data behind each line, by gid."""
         threshold = self.display.outlier_sigma
         items = self._included()
-        series, ylabels, xlabel = [], set(), ""
+        series, spectra, ylabels, xlabel = [], {}, set(), ""
         for item in items:
             stats = item.stats(threshold)
-            axis = spectral_axis(item.run.wavelengths, unit, item.run.mode,
-                                 item.run.excitation_nm, item.run.ylabel)
+            run = item.run
+            axis = spectral_axis(run.wavelengths, unit, run.mode, run.excitation_nm,
+                                 run.ylabel, self.display.jacobian)
             color, dash = plotting.compare_style(item.style)
+            gid = f"{plotting.PROBE_GID}{id(item)}"
             series.append(dict(x=axis.x, y=axis.apply(stats.average),
                                std=axis.apply(stats.std), color=color, linestyle=dash,
-                               label=item.label, gid=f"{plotting.PROBE_GID}{id(item)}"))
+                               label=item.label, gid=gid))
+            spectra[gid] = Spectrum(run.wavelengths, stats.average, run.mode,
+                                    run.excitation_nm, run.ylabel)
             ylabels.add(axis.ylabel)
             xlabel = axis.xlabel
         plotting.draw_compare(
             ax, series, **self.uncertainty.flags(), legend=self.legend_cb.isChecked(),
             ylabel=ylabels.pop() if len(ylabels) == 1 else _MIXED_YLABEL, xlabel=xlabel,
             y_from_zero=all(i.run.mode is MeasurementMode.SCOPE for i in items))
+        return spectra
 
     def _redraw(self) -> None:
         units = self._units()
@@ -409,8 +416,9 @@ class ComparePage(QtWidgets.QWidget):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             shown, total = len(self._included()), len(self._items)
+            spectra = {}
             if shown:
-                self._render(self.plot.ax, unit)
+                spectra = self._render(self.plot.ax, unit)
                 count = f"{shown} run{'s' if shown != 1 else ''}"
                 if shown < total:
                     count = f"{shown} of {total} runs"
@@ -422,7 +430,8 @@ class ComparePage(QtWidgets.QWidget):
                 plotting.draw_placeholder(self.plot.ax, message, x=axis.x,
                                           xlabel=axis.xlabel, ylabel=axis.ylabel)
                 self.plot.set_title("Compare run averages")
-            self.plot.set_units(units, unit)
+            self.plot.set_units(units, unit, self.display.jacobian)
+            self.plot.set_spectra(spectra)
             self.plot.finish_draw()
             self._set_fresh()
         except Exception as exc:
@@ -468,13 +477,13 @@ class ComparePage(QtWidgets.QWidget):
         threshold = self.display.outlier_sigma
         ref = items[0]
         ref_axis = spectral_axis(ref.run.wavelengths, unit, ref.run.mode,
-                                 ref.run.excitation_nm, ref.run.ylabel)
+                                 ref.run.excitation_nm, ref.run.ylabel, self.display.jacobian)
         order = np.argsort(ref_axis.x)
         x = ref_axis.x[order]
         headers, columns, interpolated = [ref_axis.xlabel], [x], 0
         for item in items:
             axis = spectral_axis(item.run.wavelengths, unit, item.run.mode,
-                                 item.run.excitation_nm, item.run.ylabel)
+                                 item.run.excitation_nm, item.run.ylabel, self.display.jacobian)
             y = axis.apply(item.stats(threshold).average)
             if np.array_equal(item.run.wavelengths, ref.run.wavelengths):
                 column = y[order]

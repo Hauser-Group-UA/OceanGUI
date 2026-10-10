@@ -12,15 +12,17 @@ from .units import XUNIT_LABELS, XUnit, format_x, format_y
 
 
 class DisplaySettings(QtCore.QObject):
-    """Display choices shared by every mode: x-axis unit and outlier threshold."""
+    """Display choices shared by every mode: x-axis unit, outlier threshold, Jacobian."""
 
     xunit_changed = QtCore.pyqtSignal(object)
     outlier_changed = QtCore.pyqtSignal(float)
+    jacobian_changed = QtCore.pyqtSignal(bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.xunit = XUnit.WAVELENGTH
         self.outlier_sigma = DEFAULT_OUTLIER_SIGMA
+        self.jacobian = False
 
     def set_xunit(self, unit: XUnit) -> None:
         if unit is not self.xunit:
@@ -32,6 +34,12 @@ class DisplaySettings(QtCore.QObject):
         if value != self.outlier_sigma:
             self.outlier_sigma = value
             self.outlier_changed.emit(value)
+
+    def set_jacobian(self, on) -> None:
+        on = bool(on)
+        if on != self.jacobian:
+            self.jacobian = on
+            self.jacobian_changed.emit(on)
 
 
 _TIME_UNITS = (("ms", 1.0), ("s", 1000.0), ("min", 60000.0), ("h", 3600000.0))
@@ -228,27 +236,50 @@ class SidePanel(QtWidgets.QWidget):
                             super().sizeHint().height())
 
 
-class OutlierCombo(QtWidgets.QComboBox):
-    """Outlier-threshold drop-down; every instance stays in sync."""
+class _SettingCombo(QtWidgets.QComboBox):
+    """A drop-down bound to one DisplaySettings value; every copy stays in sync."""
+
+    def __init__(self, items, value, changed, setter, tooltip: str, parent=None) -> None:
+        super().__init__(parent)
+        for text, data in items:
+            self.addItem(text, data)
+        self.setToolTip(tooltip)
+        self._show(value)
+        changed.connect(self._show)
+        self.currentIndexChanged.connect(lambda i: setter(self.itemData(i)))
+
+    def _show(self, value) -> None:
+        self.blockSignals(True)
+        self.setCurrentIndex(max(0, self.findData(value)))
+        self.blockSignals(False)
+
+
+class OutlierCombo(_SettingCombo):
+    """Outlier-threshold drop-down."""
 
     def __init__(self, settings: DisplaySettings, parent=None) -> None:
-        super().__init__(parent)
-        for value in OUTLIER_CHOICES:
-            self.addItem(f"{value:g}σ" if value else "Off", float(value))
-        self.setToolTip(
+        super().__init__(
+            [(f"{v:g}σ" if v else "Off", float(v)) for v in OUTLIER_CHOICES],
+            float(settings.outlier_sigma), settings.outlier_changed,
+            settings.set_outlier_sigma,
             "Before averaging, drop any scan's value that lies more than this many "
             "σ from the median of all scans at the same wavelength (σ estimated "
             "robustly from the median absolute deviation, adjusted for the number "
-            "of scans). On pure noise 3σ removes about 0.27% of values.")
-        self._show(settings.outlier_sigma)
-        settings.outlier_changed.connect(self._show)
-        self.currentIndexChanged.connect(
-            lambda i: settings.set_outlier_sigma(self.itemData(i)))
+            "of scans). On pure noise 3σ removes about 0.27% of values.", parent)
 
-    def _show(self, value: float) -> None:
-        self.blockSignals(True)
-        self.setCurrentIndex(max(0, self.findData(float(value))))
-        self.blockSignals(False)
+
+class JacobianCombo(_SettingCombo):
+    """Jacobian on/off drop-down."""
+
+    def __init__(self, settings: DisplaySettings, parent=None) -> None:
+        super().__init__(
+            [("Off", False), ("On", True)], settings.jacobian,
+            settings.jacobian_changed, settings.set_jacobian,
+            "Off: an energy axis shows the measured values unchanged.\n"
+            "On: intensities are converted from per nm to per eV with the Jacobian "
+            "λ²/hc, so peak shapes and areas are correct per unit energy (counts keep "
+            "their total, irradiance becomes µW/cm²/eV, ratios are not rescaled).",
+            parent)
 
 
 def describe_outliers(stats, n_scans: int) -> str:
@@ -259,13 +290,15 @@ def describe_outliers(stats, n_scans: int) -> str:
     return f"{n} outlier value{'s' if n != 1 else ''} removed ({stats.threshold_sigma:g}σ)"
 
 
-def outlier_group(settings: DisplaySettings) -> QtWidgets.QGroupBox:
-    box = QtWidgets.QGroupBox("Outlier filtering")
+def options_group(settings: DisplaySettings) -> QtWidgets.QGroupBox:
+    box = QtWidgets.QGroupBox("Outliers && energy axis")
     form = QtWidgets.QFormLayout(box)
     form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
-    form.addRow("Threshold:", OutlierCombo(settings))
-    hint = QtWidgets.QLabel("Judged separately at each wavelength, against "
-                            "the median of all scans. Applies live.")
+    form.addRow("Outlier threshold:", OutlierCombo(settings))
+    form.addRow("Jacobian (λ²/hc):", JacobianCombo(settings))
+    hint = QtWidgets.QLabel("Outliers are judged at each wavelength against the "
+                            "median of all scans. The Jacobian only changes "
+                            "intensities on an energy axis. Both apply live.")
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #666666; font-size: 11px;")
     form.addRow(hint)
@@ -386,6 +419,8 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.legend_editable = False
         self._units = (XUnit.WAVELENGTH, XUnit.ENERGY)
         self._unit = XUnit.WAVELENGTH
+        self._jacobian = False
+        self._spectra = {}
         self._pin = None
         self._pin_artists = []
         self._hovering = False
@@ -404,10 +439,15 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.title.setText(text)
         self.title.setToolTip(text)
 
-    def set_units(self, available, current: XUnit) -> None:
-        """Units offered by the x-axis-label menu, and the one being shown."""
+    def set_units(self, available, current: XUnit, jacobian: bool = False) -> None:
+        """Units offered by the x-axis-label menu, the one shown, and the Jacobian setting."""
         self._units = tuple(available)
         self._unit = current
+        self._jacobian = jacobian
+
+    def set_spectra(self, spectra) -> None:
+        """The data behind each value line, by gid, so readouts give every unit."""
+        self._spectra = dict(spectra or {})
 
     def hold_input(self) -> None:
         """Ignore clicks until the plot has finished re-rendering."""
@@ -493,8 +533,15 @@ class SpectrumPlot(QtWidgets.QWidget):
                 best = (dist, line, i)
         return None if best is None else best[1:]
 
-    def _describe(self, line, x: float, y: float, with_name: bool) -> str:
-        text = f"({format_x(x, self._unit)}, {format_y(y, self.ax.get_ylabel())})"
+    def _point_lines(self, line, i: int):
+        spectrum = self._spectra.get(line.get_gid())
+        if spectrum is not None and 0 <= i < np.size(spectrum.values):
+            return spectrum.describe(i, self._unit, self._jacobian)
+        x, y = self._xy(line)
+        return [f"({format_x(x[i], self._unit)}, {format_y(y[i], self.ax.get_ylabel())})"]
+
+    def _describe(self, line, i: int, with_name: bool) -> str:
+        text = "  |  ".join(self._point_lines(line, i))
         name = line.get_label()
         if with_name and name and not name.startswith("_"):
             text = f"{name}: {text}"
@@ -527,14 +574,14 @@ class SpectrumPlot(QtWidgets.QWidget):
         if not 0 <= i < x.size or not np.isfinite(x[i]) or not np.isfinite(y[i]):
             return
         xi, yi = float(x[i]), float(y[i])
-        self._pin_text = self._describe(line, xi, yi, with_name=len(targets) > 1)
+        self._pin_text = self._describe(line, i, with_name=len(targets) > 1)
 
         self.ax.get_xlim(), self.ax.get_ylim()
         fx, fy = self.ax.transAxes.inverted().transform(
             self.ax.transData.transform((xi, yi)))
         dx, ha = (-10, "right") if fx > 0.5 else (10, "left")
         dy, va = (-14, "top") if fy > 0.8 else (12, "bottom")
-        label = f"({format_x(xi, self._unit)}, {format_y(yi, self.ax.get_ylabel())})"
+        label = "\n".join(self._point_lines(line, i))
         name = line.get_label()
         if len(targets) > 1 and name and not name.startswith("_"):
             label = f"{name}\n{label}"
@@ -606,9 +653,7 @@ class SpectrumPlot(QtWidgets.QWidget):
             self._show_idle_text()
             return
         line, i = hit
-        x, y = self._xy(line)
-        self.readout.setText(self._describe(line, x[i], y[i],
-                                            with_name=len(self._targets()) > 1))
+        self.readout.setText(self._describe(line, i, with_name=len(self._targets()) > 1))
 
     def _on_leave(self, _event) -> None:
         self._hovering = False
@@ -676,7 +721,9 @@ class FullScreenPlot(QtWidgets.QDialog):
         row.addWidget(btn)
         lay.addLayout(row)
 
-    def render(self, draw_fn, units, unit: XUnit) -> None:
+    def render(self, draw_fn, units, unit: XUnit, jacobian: bool = False,
+               spectra=None) -> None:
         draw_fn(self.plot.ax)
-        self.plot.set_units(units, unit)
+        self.plot.set_units(units, unit, jacobian)
+        self.plot.set_spectra(spectra)
         self.plot.finish_draw()

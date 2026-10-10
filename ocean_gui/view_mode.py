@@ -6,10 +6,10 @@ from PyQt5 import QtCore, QtWidgets
 
 from . import plotting, storage
 from .processing import MODE_LABELS, MeasurementMode, scan_statistics
-from .units import EXAMPLE_WAVELENGTHS, available_units, spectral_axis
+from .units import EXAMPLE_WAVELENGTHS, Spectrum, available_units, spectral_axis
 from .widgets import (DisplaySettings, ElidedLabel, FullScreenPlot, SidePanel,
                       SpectrumPlot, UncertaintyBox, breakable, describe_outliers,
-                      outlier_group, scroll_page)
+                      options_group, scroll_page)
 
 
 class ViewPage(QtWidgets.QWidget):
@@ -37,11 +37,12 @@ class ViewPage(QtWidgets.QWidget):
         self.uncertainty = UncertaintyBox()
         self.uncertainty.changed.connect(self._draw_average)
         pl.addWidget(scroll_page([self._group_file(), self._group_scan(),
-                                  outlier_group(display), self.uncertainty]), 1)
+                                  options_group(display), self.uncertainty]), 1)
         layout.addWidget(panel, 0)
         layout.addWidget(self._build_plots(), 1)
 
-        display.xunit_changed.connect(self._on_xunit_changed)
+        display.xunit_changed.connect(self._on_axis_changed)
+        display.jacobian_changed.connect(self._on_axis_changed)
         display.outlier_changed.connect(self._on_outlier_changed)
         self._show_empty("Open a saved run (…_data.csv)")
 
@@ -239,7 +240,11 @@ class ViewPage(QtWidgets.QWidget):
     def _axis(self):
         run = self._run
         return spectral_axis(run.wavelengths, self.display.xunit, run.mode,
-                             run.excitation_nm, run.ylabel)
+                             run.excitation_nm, run.ylabel, self.display.jacobian)
+
+    def _spectrum(self, values) -> Spectrum:
+        run = self._run
+        return Spectrum(run.wavelengths, values, run.mode, run.excitation_nm, run.ylabel)
 
     def _units(self):
         return available_units(self._run.mode, self._run.excitation_nm)
@@ -247,7 +252,7 @@ class ViewPage(QtWidgets.QWidget):
     def _y_from_zero(self) -> bool:
         return self._run.mode is MeasurementMode.SCOPE
 
-    def _on_xunit_changed(self, _unit) -> None:
+    def _on_axis_changed(self, *_) -> None:
         plots = [self.plot_scan, self.plot_avg]
         if self._fs_plot is not None:
             plots.append(self._fs_plot.plot)
@@ -281,7 +286,9 @@ class ViewPage(QtWidgets.QWidget):
                                   y_from_zero=self._y_from_zero(),
                                   gid=plotting.PROBE_GID + "scan")
             self.plot_scan.set_title(f"Scan {self._index + 1} of {self._n_scans()}")
-            self.plot_scan.set_units(self._units(), axis.unit)
+            self.plot_scan.set_units(self._units(), axis.unit, self.display.jacobian)
+            self.plot_scan.set_spectra({plotting.PROBE_GID + "scan":
+                                        self._spectrum(self._run.scans[self._index])})
             self.plot_scan.finish_draw()
         except Exception as exc:
             self.status_message.emit(f"Plot update skipped: {exc}")
@@ -308,11 +315,13 @@ class ViewPage(QtWidgets.QWidget):
             title = f"Average of {n} scan{'s' if n != 1 else ''}"
             note = describe_outliers(self._stats_now(), n)
             self.plot_avg.set_title(f"{title}  ·  {note}" if note else title)
-            self.plot_avg.set_units(self._units(), axis.unit)
+            spectra = {plotting.PROBE_GID + "average": self._spectrum(self._stats_now().average)}
+            self.plot_avg.set_units(self._units(), axis.unit, self.display.jacobian)
+            self.plot_avg.set_spectra(spectra)
             self.plot_avg.finish_draw()
             if self._fs_plot is not None:
                 self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
-                                     self._units(), axis.unit)
+                                     self._units(), axis.unit, self.display.jacobian, spectra)
         except Exception as exc:
             self.status_message.emit(f"Plot update skipped: {exc}")
 
@@ -329,7 +338,9 @@ class ViewPage(QtWidgets.QWidget):
             self._fs_plot.plot.unit_selected.connect(self.display.set_xunit)
         axis = self._axis()
         self._fs_plot.render(lambda ax: self._draw_average_into(ax, axis),
-                             self._units(), axis.unit)
+                             self._units(), axis.unit, self.display.jacobian,
+                             {plotting.PROBE_GID + "average":
+                              self._spectrum(self._stats_now().average)})
         self._fs_plot.showFullScreen()
         self._fs_plot.raise_()
 

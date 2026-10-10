@@ -24,11 +24,13 @@ If no spectrometer (or backend) is present, the app automatically runs in
     column per ticked run.
 - **Wavelength / energy x-axis**: click any plot's x-axis label to switch
   between wavelength (nm) and energy (eV) (and Raman shift for Raman data).
-  Intensities are converted with the Jacobian λ²/hc so peak shapes and areas
-  stay correct (counts keep their total; irradiance becomes µW/cm²/eV; ratios
-  are not rescaled).
+  An optional **Jacobian** setting (Off by default, next to the outlier
+  threshold) converts intensities to per eV with λ²/hc on an energy axis
+  (counts keep their total; irradiance becomes µW/cm²/eV; ratios are not
+  rescaled).
 - **Read values off the plots**: hover to see the value under the cursor;
-  click to mark a point with its (x, y); right-click to clear.
+  click to mark a point; right-click to clear. Readouts always give both
+  wavelength and energy (with the Jacobian-scaled intensity when it is on).
 - **Automatic outlier filtering** (e.g. cosmic-ray spikes): each wavelength is
   checked against the median of all scans with a robust σ, adjusted for the
   number of scans; choose Off / 1.5σ / 2σ / 2.5σ / 3σ (default) live, from the
