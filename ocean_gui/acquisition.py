@@ -43,11 +43,11 @@ class AcquisitionSettings:
 
 
 class AcquisitionWorker(QtCore.QThread):
-    """Collect processed scans. Averaging (with outlier filtering) is done by
-    the GUI, so the filter can be changed while the run is in progress."""
+    """Collect processed scans and hand each one to the GUI, which keeps them
+    and does the averaging (so the filter can be changed mid-run)."""
 
     progress = QtCore.pyqtSignal(int, int, object, object)
-    finished_ok = QtCore.pyqtSignal(object, object)
+    finished_ok = QtCore.pyqtSignal(object, int)
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, spec: SpectrometerInterface, settings: AcquisitionSettings,
@@ -71,7 +71,6 @@ class AcquisitionWorker(QtCore.QThread):
                                  correct_nonlinearity=settings.correct_nonlinearity)
 
             wavelengths = self._spec.wavelengths()
-            collected = np.empty((total, wavelengths.size), dtype=float)
             count = 0
 
             for i in range(total):
@@ -83,7 +82,6 @@ class AcquisitionWorker(QtCore.QThread):
                 )
                 intensities = processor.apply(
                     raw, wavelengths, settings.single_time_ms / 1000.0)
-                collected[count] = intensities
                 count += 1
                 self.progress.emit(count, total, wavelengths, intensities)
 
@@ -94,7 +92,7 @@ class AcquisitionWorker(QtCore.QThread):
                 self.failed.emit("Acquisition aborted before any data was collected.")
                 return
 
-            self.finished_ok.emit(wavelengths, collected[:count])
+            self.finished_ok.emit(wavelengths, count)
         except Exception as exc:
             self.failed.emit(str(exc))
 

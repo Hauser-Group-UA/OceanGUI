@@ -121,9 +121,20 @@ def draw_average(
         ax.legend(loc="upper right", fontsize=LEGEND_FONTSIZE, framealpha=0.9)
 
 
+MAX_OVERLAY_SCANS = 300
+
+
+def overlay_rows(all_intensities):
+    """At most MAX_OVERLAY_SCANS evenly spaced scans (drawing thousands takes minutes)."""
+    n = len(all_intensities)
+    if n <= MAX_OVERLAY_SCANS:
+        return all_intensities
+    return all_intensities[np.linspace(0, n - 1, MAX_OVERLAY_SCANS).round().astype(int)]
+
+
 def draw_overlay(ax, wavelengths, all_intensities, average, *, ylabel: str = YLABEL,
                  xlabel: str = XLABEL, y_from_zero: bool = True) -> None:
-    """Average in red with each individual integration in grey behind it."""
+    """Average in red with the individual integrations in grey behind it."""
     ax.clear()
     for row in all_intensities:
         ax.plot(wavelengths, row, color=GREY, linewidth=0.6, alpha=0.5)

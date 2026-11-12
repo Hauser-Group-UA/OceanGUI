@@ -1,6 +1,8 @@
 import csv
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -94,6 +96,37 @@ def save_csv(
             row += [f"{average[j]:.4f}", f"{std[j]:.4f}"]
             writer.writerow(row)
     return path
+
+
+class ScanLog:
+    """Writes each scan to disk as it arrives, one row per scan, so a crash or
+    power cut mid-run loses at most the scan in progress. View mode can open it."""
+
+    SUFFIX = "_scans_in_progress.csv"
+
+    def __init__(self, path: Path, wavelengths: np.ndarray, metadata: dict) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "w", newline="", encoding="utf-8")
+        for key, value in metadata.items():
+            self._fh.write(f"# {key},{value}\n")
+        self._fh.write("scan," + ",".join(f"{w:.4f}" for w in wavelengths) + "\n")
+        self._fh.flush()
+        self._synced = time.monotonic()
+
+    def append(self, index: int, values: np.ndarray) -> None:
+        self._fh.write(f"{index}," + ",".join(f"{v:.4f}" for v in values) + "\n")
+        self._fh.flush()
+        if time.monotonic() - self._synced > 10:
+            os.fsync(self._fh.fileno())
+            self._synced = time.monotonic()
+
+    def close(self, delete: bool = False) -> None:
+        try:
+            self._fh.close()
+        finally:
+            if delete:
+                self.path.unlink(missing_ok=True)
 
 
 def threshold_tag(sigma: float) -> str:
@@ -240,6 +273,13 @@ def load_run(path) -> RunData:
         elif line.strip():
             header, start = next(csv.reader([line])), i + 1
             break
+    if header and header[0].strip().lower() == "scan":
+        rows = [line for line in lines[start:] if line.count(",") == len(header) - 1]
+        data = np.loadtxt(rows, delimiter=",", ndmin=2) if rows else np.empty((0, len(header)))
+        if data.shape[0] < 1:
+            raise ValueError("the file holds no scans yet.")
+        return RunData(path=path, wavelengths=np.array([float(w) for w in header[1:]]),
+                       scans=np.ascontiguousarray(data[:, 1:]), metadata=metadata)
     if not header or not header[0].strip().lower().startswith("wavelength"):
         raise ValueError("not a saved spectrum: the first column must be the wavelength.")
     try:

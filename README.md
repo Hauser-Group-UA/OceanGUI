@@ -73,8 +73,12 @@ If no spectrometer (or backend) is present, the app automatically runs in
     open directly in Excel.
   - `*_total.png` — picture of the total/average integration.
   - `*_average.png` — average integration, no bars/bands.
-  - `*_average_overlay.png` — average in **red** over each individual
-    integration in **grey**.
+  - `*_average_overlay.png` — average in **red** over the individual
+    integrations in **grey** (at most 300, evenly spaced).
+- **Long-run safety**: the computer is kept from idling into sleep during a
+  run, each scan is written to `*_scans_in_progress.csv` as it arrives (deleted
+  once the run is saved; open it in View mode if a run is cut off), and if the
+  spectrometer fails part way the scans collected so far are saved.
 - **Save outputs (current settings)** button — re-writes the run's files with
   the current outlier filter and x-axis, plus the average plot with the
   currently-enabled uncertainty overlays.
@@ -234,6 +238,7 @@ OceanGUI/
 │   ├── compare_mode.py  # Compare mode (overlay run averages)
 │   ├── widgets.py       # shared widgets (interactive plot, side panel, ...)
 │   ├── acquisition.py   # settings model + acquisition/capture threads
+│   ├── keepawake.py     # blocks idle sleep during a run
 │   ├── spectrometer.py  # seabreeze wrapper + simulation fallback
 │   ├── processing.py    # measurement modes, dark/reference, smoothing, outlier filter
 │   ├── units.py         # wavelength / energy / Raman-shift axes

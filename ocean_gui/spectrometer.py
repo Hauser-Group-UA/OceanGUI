@@ -30,6 +30,10 @@ class SpectrometerError(RuntimeError):
     """Raised when the spectrometer cannot be opened or read."""
 
 
+class CorrectionUnsupported(SpectrometerError):
+    """The device reads fine but cannot apply a requested correction."""
+
+
 class SimulatedSpectrometer:
     model = "Simulated"
     serial_number = "SIM-0001"
@@ -204,8 +208,7 @@ class SpectrometerInterface:
 
         ``correct_dark_counts`` and ``correct_nonlinearity`` require hardware
         support (electric-dark pixels / EEPROM coefficients). Devices lacking
-        them raise; the error is wrapped as :class:`SpectrometerError` so the
-        GUI can show a clear popup and let the user disable the option.
+        them raise; :meth:`probe_corrections` tells that apart from a failed read.
         """
         try:
             data = self._device.intensities(
@@ -215,20 +218,25 @@ class SpectrometerInterface:
         except SpectrometerError:
             raise
         except Exception as exc:
-            raise SpectrometerError(
-                f"This device does not support the requested correction "
-                f"(dark={correct_dark_counts}, nonlinearity={correct_nonlinearity}): {exc}"
-            ) from exc
+            raise SpectrometerError(f"Could not read the spectrometer: {exc}") from exc
         return np.asarray(data, dtype=float)
 
     def probe_corrections(self, correct_dark_counts: bool,
                           correct_nonlinearity: bool) -> None:
         """Take one reading with the given corrections to verify support.
 
-        Raises :class:`SpectrometerError` if the device cannot honour them.
+        Raises :class:`CorrectionUnsupported` if a plain read works but the
+        corrected one doesn't, or :class:`SpectrometerError` if nothing reads.
         """
-        self.intensities(correct_dark_counts=correct_dark_counts,
-                         correct_nonlinearity=correct_nonlinearity)
+        try:
+            self.intensities(correct_dark_counts=correct_dark_counts,
+                             correct_nonlinearity=correct_nonlinearity)
+        except SpectrometerError as exc:
+            self.intensities()
+            raise CorrectionUnsupported(
+                f"This device does not support the requested correction "
+                f"(dark={correct_dark_counts}, nonlinearity={correct_nonlinearity}): {exc}"
+            ) from exc
 
     def supports_electric_dark(self) -> bool:
         """Whether electric-dark correction is available (no acquisition).

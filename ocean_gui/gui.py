@@ -1,4 +1,5 @@
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,10 +12,12 @@ from . import plotting, storage
 from .acquisition import (AcquisitionSettings, AcquisitionWorker, CaptureWorker,
                           RunMode)
 from .compare_mode import ComparePage
+from .keepawake import KeepAwake
 from .processing import (MODE_LABELS, MODE_YLABELS, MeasurementMode, Processor,
                          requires_calibration, requires_dark, requires_excitation,
                          requires_reference, scan_statistics)
-from .spectrometer import SpectrometerError, SpectrometerInterface, backend_status
+from .spectrometer import (CorrectionUnsupported, SpectrometerError,
+                           SpectrometerInterface, backend_status)
 from .units import (EXAMPLE_WAVELENGTHS, Spectrum, XUnit, available_units,
                     spectral_axis)
 from .view_mode import ViewPage
@@ -171,9 +174,15 @@ values were removed.</p>
     filter), ready to open in Excel.</li>
 <li><code>*_total.png</code> - picture of the total/average integration.</li>
 <li><code>*_average.png</code> - average integration, no bars/bands.</li>
-<li><code>*_average_overlay.png</code> - average in red over each individual
-    integration in grey.</li>
+<li><code>*_average_overlay.png</code> - average in red over the individual
+    integrations in grey (at most 300, evenly spaced, so long runs save quickly).</li>
 </ul>
+<p><b>Long runs.</b> While a run is in progress the computer is kept from going
+to sleep (closing a laptop lid or choosing Sleep still sleeps it). Each scan is
+also written to <code>*_scans_in_progress.csv</code> as it arrives; that file is
+deleted once the run's files are saved, and stays behind - open it in View mode
+- if the app or computer stops mid-run. If the spectrometer fails part way, the
+scans collected so far are saved and the CSV header records why it stopped.</p>
 <p><b>Save outputs (current settings)</b> re-writes all of these with the
 current outlier filter and x-axis, and also saves
 <code>*_total_with_uncertainty.png</code> with the bars/bands enabled on the
@@ -250,6 +259,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._latest_index = 0
         self._latest_total = 0
         self._buffer: Optional[np.ndarray] = None
+        self._scan_log: Optional[storage.ScanLog] = None
+        self._scan_log_failed = False
+        self._keep_awake = KeepAwake()
         self._stats = None
 
         self._connected = False
@@ -792,11 +804,13 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                 correct_dark_counts=self.cb_electric_dark.isChecked(),
                 correct_nonlinearity=self.cb_nonlinearity.isChecked(),
             )
-        except SpectrometerError as exc:
+        except CorrectionUnsupported as exc:
             QtWidgets.QMessageBox.warning(self, "Correction not supported", str(exc))
             checkbox.blockSignals(True)
             checkbox.setChecked(False)
             checkbox.blockSignals(False)
+        except SpectrometerError as exc:
+            QtWidgets.QMessageBox.warning(self, "Spectrometer not responding", str(exc))
 
     def _busy(self) -> bool:
         return ((self.worker is not None and self.worker.isRunning())
@@ -1044,7 +1058,9 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                 self.spec.probe_corrections(settings.correct_dark_counts,
                                             settings.correct_nonlinearity)
             except SpectrometerError as exc:
-                QtWidgets.QMessageBox.warning(self, "Correction not supported", str(exc))
+                title = ("Correction not supported" if isinstance(exc, CorrectionUnsupported)
+                         else "Spectrometer not responding")
+                QtWidgets.QMessageBox.warning(self, title, str(exc))
                 return
 
         try:
@@ -1059,6 +1075,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
                          metadata=self._processing_metadata(settings))
         self._wavelengths = self._scans = self._latest = None
         self._buffer = self._stats = None
+        self._scan_log, self._scan_log_failed = None, False
         self.progress.setMaximum(settings.integrations_count())
         self.progress.setValue(0)
         self._draw_placeholders()
@@ -1075,7 +1092,11 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.export_btn.setEnabled(False)
         self._set_device_controls_enabled(False)
         self._set_busy_controls(False)
-        self._update_status(f"Running -> {run_dir}")
+        if self._keep_awake.start():
+            self._update_status(f"Running -> {run_dir}  (sleep is blocked until the run ends)")
+        else:
+            self._update_status(f"Running -> {run_dir}  (could not block sleep: keep the "
+                                "computer awake)")
 
     def _clamp_ms(self, ms: float) -> float:
         """The integration time the device would actually apply for ``ms``."""
@@ -1119,9 +1140,14 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
     def _on_progress(self, index, total, wavelengths, intensities) -> None:
         n_pixels = np.size(wavelengths)
-        if self._buffer is None or self._buffer.shape != (total, n_pixels):
-            self._buffer = np.empty((total, n_pixels), dtype=float)
+        if self._buffer is None or self._buffer.shape[1] != n_pixels:
+            self._buffer = np.empty((min(total, 256), n_pixels), dtype=float)
+        elif index > len(self._buffer):
+            grown = np.empty((min(total, 2 * len(self._buffer)), n_pixels), dtype=float)
+            grown[:len(self._buffer)] = self._buffer
+            self._buffer = grown
         self._buffer[index - 1] = intensities
+        self._log_scan(index, wavelengths, intensities)
         self._wavelengths = wavelengths
         self._scans = self._buffer[:index]
         self._latest = intensities
@@ -1131,12 +1157,53 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         if not self._redraw_timer.isActive():
             self._redraw_timer.start()
 
-    def _on_finished(self, wavelengths, all_intensities) -> None:
+    def _log_scan(self, index, wavelengths, intensities) -> None:
+        if self._scan_log_failed:
+            return
+        try:
+            if self._scan_log is None:
+                run = self._run
+                self._scan_log = storage.ScanLog(
+                    run.run_dir / f"{run.name}{storage.ScanLog.SUFFIX}", wavelengths,
+                    {"single_integration_time_ms": run.single_ms, **run.metadata})
+            self._scan_log.append(index, intensities)
+        except Exception as exc:
+            self._end_scan_log(delete=False)
+            self._scan_log_failed = True
+            self._update_status(f"Could not write scans to disk as they arrive ({exc}); "
+                                "they are kept in memory and saved when the run ends.")
+
+    def _end_scan_log(self, delete: bool) -> Optional[Path]:
+        """Close the on-disk scan log; returns its path if it was kept."""
+        log, self._scan_log = self._scan_log, None
+        if log is None:
+            return None
+        try:
+            log.close(delete=delete)
+        except OSError:
+            pass
+        return None if delete else log.path
+
+    def _save_collected(self) -> Optional[str]:
+        """Write the run's outputs; returns an error message, or None if saved."""
+        try:
+            csv_path = self._write_outputs_busy(with_uncertainty=False)
+        except Exception as exc:
+            kept = self._end_scan_log(delete=False)
+            where = f"\n\nThey were also written to:\n{kept}" if kept else ""
+            return (f"Saving failed: {exc}\n\nThe integrations are still in memory - fix "
+                    "the problem and press Save outputs (current settings) to try again."
+                    + where)
+        self._end_scan_log(delete=True)
+        self.view_page.notify_run_saved(csv_path)
+        return None
+
+    def _on_finished(self, wavelengths, count) -> None:
         self.worker = None
         self._redraw_timer.stop()
+        self._keep_awake.stop()
         self._wavelengths = wavelengths
-        self._scans = all_intensities
-        self._latest = all_intensities[-1]
+        self._latest = self._scans[-1]
         self._buffer = None
         self._stats = None
 
@@ -1148,23 +1215,42 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._refresh_start_enabled()
 
         self._redraw_capture()
-        try:
-            csv_path = self._write_outputs_busy(with_uncertainty=False)
-            self._update_status(
-                f"Done. {all_intensities.shape[0]} integrations saved to {self._run.run_dir}")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
-            return
-        self.view_page.notify_run_saved(csv_path)
+        error = self._save_collected()
+        if error:
+            QtWidgets.QMessageBox.critical(self, "Save failed", error)
+        else:
+            self._update_status(f"Done. {len(self._scans)} integrations saved to "
+                                f"{self._run.run_dir}")
 
     def _on_failed(self, message: str) -> None:
-        QtWidgets.QMessageBox.critical(self, "Acquisition failed", message)
-        self.stop_btn.setEnabled(False)
         self.worker = None
+        self._redraw_timer.stop()
+        self._keep_awake.stop()
+        self.stop_btn.setEnabled(False)
         self._set_device_controls_enabled(True)
         self._set_busy_controls(True)
         self._refresh_start_enabled()
-        self._update_status("Acquisition failed.")
+        if self._scans is None or not len(self._scans):
+            self._end_scan_log(delete=True)
+            if self._run is not None:
+                try:
+                    self._run.run_dir.rmdir()
+                except OSError:
+                    pass
+            QtWidgets.QMessageBox.critical(self, "Acquisition failed", message)
+            self._update_status("Acquisition failed.")
+            return
+        n = len(self._scans)
+        self._run.metadata["stopped_early"] = " ".join(message.split())
+        self._redraw_capture()
+        self.save_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        error = self._save_collected()
+        outcome = error or (f"The {n} integrations collected before the problem were "
+                            f"saved to:\n{self._run.run_dir}")
+        self._update_status(f"Acquisition stopped early after {n} integrations.")
+        QtWidgets.QMessageBox.warning(self, "Acquisition stopped early",
+                                      f"{message}\n\n{outcome}")
 
     def _y_from_zero(self) -> bool:
         return self._run.mode is MeasurementMode.SCOPE
@@ -1203,6 +1289,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         if self._scans is None:
             self._draw_placeholders()
             return
+        started = time.perf_counter()
         try:
             axis = self._capture_axis()
             plotting.draw_current(self.plot_current.ax, axis.x, axis.apply(self._latest),
@@ -1218,6 +1305,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             self._draw_average_plot(axis)
         except Exception as exc:
             self._update_status(f"Plot update skipped: {exc}")
+        self._redraw_timer.setInterval(max(40, int(4000 * (time.perf_counter() - started))))
 
     def _draw_average_into(self, ax, axis) -> None:
         """Render the run average (with the enabled bars/bands) onto the given axes."""
@@ -1307,11 +1395,13 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             meta["collection_area_cm2"] = self.area_cm2.value()
             meta["calibration_loaded"] = self.processor.calibration is not None
         meta["measurement_mode_id"] = mode.value
+        meta["integrations_planned"] = settings.integrations_count()
         return meta
 
     def _write_outputs(self, with_uncertainty: bool) -> Path:
         """Write the run's CSVs and figures with the current outlier filter and x-axis."""
         run = self._run
+        run.run_dir.mkdir(parents=True, exist_ok=True)
         base = run.run_dir / run.name
         stats = self._capture_stats()
         meta = dict(run.metadata)
@@ -1331,7 +1421,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
 
         axis = self._capture_axis()
         x, avg, std = axis.x, axis.apply(stats.average), axis.apply(stats.std)
-        alli = axis.apply(self._scans)
+        alli = axis.apply(plotting.overlay_rows(self._scans))
         labels = dict(ylabel=axis.ylabel, xlabel=axis.xlabel, y_from_zero=self._y_from_zero())
         self._save_paper_figure(
             lambda ax: plotting.draw_average(ax, x, avg, std, **labels), f"{base}_total.png")
@@ -1389,6 +1479,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return
+        (self._run.run_dir / f"{self._run.name}{storage.ScanLog.SUFFIX}").unlink(missing_ok=True)
         self.view_page.notify_run_saved(csv_path)
         self._update_status(f"Saved outputs (current settings) to {self._run.run_dir}")
 
@@ -1422,6 +1513,8 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             event.ignore()
             return
 
+        self._keep_awake.stop()
+        self._end_scan_log(delete=False)
         if self._fs_plot is not None:
             self._fs_plot.close()
         if self.capture_worker is not None and self.capture_worker.isRunning():
