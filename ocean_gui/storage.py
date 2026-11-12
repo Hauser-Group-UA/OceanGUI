@@ -241,6 +241,11 @@ class RunData:
     def integration_ms(self) -> Optional[float]:
         return _to_float(self.metadata.get("single_integration_time_ms"))
 
+    @property
+    def down_time_ms(self) -> Optional[float]:
+        """None for files saved before down time was recorded."""
+        return _to_float(self.metadata.get("down_time_ms"))
+
 
 def _to_float(value) -> Optional[float]:
     try:

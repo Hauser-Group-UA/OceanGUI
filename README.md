@@ -14,8 +14,9 @@ If no spectrometer (or backend) is present, the app automatically runs in
 - **Three modes** (the **Mode** menu, Ctrl+1/2/3):
   - **Capture** - acquire spectra (everything below);
   - **View** - open a saved run and step through its scans (or jump to a
-    scan number) next to the run average. It follows the most recent run
-    until you open a specific file;
+    scan number, or play / rewind through them at an adjustable rate, with
+    the scan's time shown as h:mm:ss/total) next to the run average. It
+    follows the most recent run until you open a specific file;
   - **Compare** - overlay the averages of several saved runs, in a reorderable
     list (top = drawn on top; untick a run to hide it without removing it) with
     colour-blind-safe colours that switch to dashed/dotted lines after four, an
@@ -40,7 +41,7 @@ If no spectrometer (or backend) is present, the app automatically runs in
   (also used to change device), **Reconnect**, and **Refresh** buttons. The
   status auto-refreshes every 2 s.
 - **Measurement modes** (like OceanView): **Scope** (raw counts), **Scope minus
-  dark**, **Absorbance**, **Transmittance (%)**, **Reflectance (%)**,
+  dark** (the default; capture a dark first), **Absorbance**, **Transmittance (%)**, **Reflectance (%)**,
   **Absolute irradiance** (µW/cm²/nm, from a radiometric calibration file) and
   **Raman shift** (cm⁻¹, relative to an excitation wavelength). The plot axes
   are labelled to match the selected mode (the x-axis becomes Raman shift in

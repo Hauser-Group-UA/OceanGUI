@@ -83,7 +83,7 @@ D = dark, R = reference):</p>
 <ul>
 <li><b>Scope</b> - raw counts (no processing). <i>This is the mode for
     fluorescence / emission</i> - there is no separate transform for it.</li>
-<li><b>Scope minus dark</b> - raw counts with the stored dark subtracted; good
+<li><b>Scope minus dark</b> (the default) - raw counts with the stored dark subtracted; good
     for background-subtracted fluorescence. <i>Needs a dark.</i></li>
 <li><b>Absorbance</b> - A = -log10((S-D)/(R-D)). <i>Needs a dark and a
     reference.</i></li>
@@ -113,10 +113,10 @@ current mode needs are enabled.</p>
 
 <h3>7. Corrections &amp; smoothing</h3>
 <p><b>Electric dark</b> and <b>Nonlinearity</b> corrections use device features
-that <i>not all spectrometers provide</i>. On connect they are <b>turned on
-automatically when the device supports them</b> (and left off otherwise). You
-can still toggle them manually; if you enable one the device can't do, a popup
-explains and it switches back off. <b>Boxcar width</b> applies software
+that <i>not all spectrometers provide</i>. On connect, <b>Electric dark is
+turned on automatically when the device supports it</b>; <b>Nonlinearity always
+starts off</b>. You can toggle either manually; if you enable one the device
+can't do, a popup explains and it switches back off. <b>Boxcar width</b> applies software
 smoothing (0 = off).</p>
 
 <h3>8. Plots</h3>
@@ -198,7 +198,12 @@ average (with the same outlier filter, uncertainty and x-axis options). It opens
 the most recent run automatically and moves to each new run you acquire, until
 you <b>Open…</b> a specific file (<b>Latest run</b> goes back to following).
 Step through scans with the arrow buttons (hold to repeat) or the slider, or
-type a scan number and press Enter to jump straight to it.</p>
+type a scan number and press Enter to jump straight to it. Below the slider,
+play (▶), pause and rewind (play backwards) step through the scans
+automatically at the speed chosen on the left (10 scans per second by
+default). The time on the right, h:mm:ss/total, is when the scan shown
+finished and when the run ended, worked out from the saved integration time
+and down time.</p>
 
 <h3>12. Compare mode</h3>
 <p><b>Add files…</b> to overlay the <i>average</i> of each run. The list order
@@ -495,6 +500,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self.mode_combo = QtWidgets.QComboBox()
         for mode in MeasurementMode:
             self.mode_combo.addItem(MODE_LABELS[mode], mode)
+        self.mode_combo.setCurrentIndex(self.mode_combo.findData(MeasurementMode.DARK_SUBTRACT))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         ml.addWidget(self.mode_combo)
         self.mode_hint = QtWidgets.QLabel("")
@@ -971,20 +977,16 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
         self._auto_enable_corrections()
 
     def _auto_enable_corrections(self) -> None:
-        """Turn on the device corrections that are supported, by default.
+        """On connect: electric dark on if the device supports it; nonlinearity off.
 
-        Capability is checked without acquiring, and signals are blocked so the
-        manual-toggle probe (and its 'not supported' popup) never fires here -
-        that's why connecting to the simulated device no longer pops a warning
-        about nonlinearity.
+        Signals are blocked so the manual-toggle probe (and its popup) doesn't fire.
         """
         if self.spec is None:
             return
-        for checkbox, supported in (
-                (self.cb_electric_dark, self.spec.supports_electric_dark()),
-                (self.cb_nonlinearity, self.spec.supports_nonlinearity())):
+        for checkbox, on in ((self.cb_electric_dark, self.spec.supports_electric_dark()),
+                             (self.cb_nonlinearity, False)):
             checkbox.blockSignals(True)
-            checkbox.setChecked(bool(supported))
+            checkbox.setChecked(bool(on))
             checkbox.blockSignals(False)
 
     def _connect_selected(self) -> None:
@@ -1396,6 +1398,7 @@ class SpectrometerGUI(QtWidgets.QMainWindow):
             meta["calibration_loaded"] = self.processor.calibration is not None
         meta["measurement_mode_id"] = mode.value
         meta["integrations_planned"] = settings.integrations_count()
+        meta["down_time_ms"] = settings.down_time_ms
         return meta
 
     def _write_outputs(self, with_uncertainty: bool) -> Path:

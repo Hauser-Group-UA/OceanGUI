@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import plotting, storage
 from .processing import MODE_LABELS, MeasurementMode, scan_statistics
@@ -10,6 +10,17 @@ from .units import EXAMPLE_WAVELENGTHS, Spectrum, available_units, spectral_axis
 from .widgets import (DisplaySettings, ElidedLabel, FullScreenPlot, SidePanel,
                       SpectrumPlot, UncertaintyBox, breakable, describe_outliers,
                       options_group, scroll_page)
+
+
+FPS_CHOICES = (1, 2, 5, 10, 20, 30)
+
+
+def clock(ms: float, digits: int = 0) -> str:
+    """'h:mm:ss' (with ``digits`` decimals on the seconds)."""
+    h, rem = divmod(round(ms / 1000.0, digits), 3600)
+    m, s = divmod(rem, 60)
+    width = 3 + digits if digits else 2
+    return f"{int(h)}:{int(m):02d}:{s:0{width}.{digits}f}"
 
 
 class ViewPage(QtWidgets.QWidget):
@@ -29,6 +40,9 @@ class ViewPage(QtWidgets.QWidget):
         self._latest_saved: Optional[Path] = None
         self._needs_latest = True
         self._fs_plot: Optional[FullScreenPlot] = None
+        self._direction = 0
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.timeout.connect(self._play_step)
 
         layout = QtWidgets.QHBoxLayout(self)
         panel = SidePanel()
@@ -85,6 +99,8 @@ class ViewPage(QtWidgets.QWidget):
         self.scan_spin.setKeyboardTracking(False)
         self.scan_spin.setToolTip("Type a scan number and press Enter to jump to it")
         self.scan_spin.valueChanged.connect(lambda v: self._set_index(v - 1))
+        self.scan_spin.editingFinished.connect(
+            lambda: self.scan_spin.lineEdit().setModified(False))
         self.of_label = QtWidgets.QLabel("of 0")
         self.next_btn = self._nav_button(style.standardIcon(QtWidgets.QStyle.SP_MediaSeekForward),
                                          "Next scan", lambda: self._set_index(self._index + 1),
@@ -102,8 +118,99 @@ class ViewPage(QtWidgets.QWidget):
         self.scan_slider.valueChanged.connect(lambda v: self._set_index(v - 1))
         v.addLayout(row)
         v.addWidget(self.scan_slider)
+        v.addLayout(self._play_row(style))
         self._set_nav_enabled()
         return box
+
+    def _play_row(self, style) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+        self.fps_combo = QtWidgets.QComboBox()
+        for fps in FPS_CHOICES:
+            self.fps_combo.addItem(f"{fps} fps", fps)
+        self.fps_combo.setCurrentIndex(self.fps_combo.findData(10))
+        self.fps_combo.setToolTip("Playback speed, in scans per second")
+        self.fps_combo.currentIndexChanged.connect(
+            lambda *_: self._play_timer.setInterval(self._frame_ms()))
+        play_icon = style.standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        rewind_icon = QtGui.QIcon(play_icon.pixmap(32, 32).transformed(QtGui.QTransform().scale(-1, 1)))
+        self._play_group = QtWidgets.QButtonGroup(self)
+        self.rewind_btn = self._play_button(rewind_icon, "Play backwards (rewind)", -1)
+        self.pause_btn = self._play_button(style.standardIcon(QtWidgets.QStyle.SP_MediaPause),
+                                           "Pause", 0)
+        self.play_btn = self._play_button(play_icon, "Play through the scans", 1)
+        self.pause_btn.setChecked(True)
+        self.time_label = QtWidgets.QLabel("")
+        row.addWidget(self.fps_combo)
+        row.addWidget(self.rewind_btn)
+        row.addWidget(self.pause_btn)
+        row.addWidget(self.play_btn)
+        row.addWidget(self.time_label, 1)
+        return row
+
+    def _play_button(self, icon, tip: str, direction: int) -> QtWidgets.QToolButton:
+        btn = QtWidgets.QToolButton()
+        btn.setIcon(icon)
+        btn.setToolTip(tip)
+        btn.setCheckable(True)
+        btn.clicked.connect(lambda: self._play(direction))
+        self._play_group.addButton(btn)
+        return btn
+
+    def _frame_ms(self) -> int:
+        return int(1000 / self.fps_combo.currentData())
+
+    def _play(self, direction: int) -> None:
+        """Step through scans: 1 forwards, -1 backwards, 0 pause."""
+        n = self._n_scans()
+        if direction == 0 or n < 2:
+            self._direction = 0
+            self._play_timer.stop()
+            self.pause_btn.setChecked(True)
+            return
+        if (direction > 0 and self._index >= n - 1) or (direction < 0 and self._index <= 0):
+            self._set_index(0 if direction > 0 else n - 1)
+        self._direction = direction
+        (self.play_btn if direction > 0 else self.rewind_btn).setChecked(True)
+        self._play_timer.start(self._frame_ms())
+
+    def _navigating(self) -> bool:
+        """The user is typing a scan number, holding a step button or dragging."""
+        edit = self.scan_spin.lineEdit()
+        return (self.scan_slider.isSliderDown() or self.prev_btn.isDown()
+                or self.next_btn.isDown() or (edit.hasFocus() and edit.isModified()))
+
+    def _play_step(self) -> None:
+        if self._navigating():
+            return
+        nxt = self._index + self._direction
+        if not 0 <= nxt < self._n_scans():
+            self._play(0)
+            return
+        self._set_index(nxt)
+
+    def hideEvent(self, event) -> None:
+        self._play(0)
+        super().hideEvent(event)
+
+    def _update_time(self) -> None:
+        run = self._run
+        single = run.integration_ms if run is not None else None
+        if single is None:
+            self.time_label.setText("")
+            self.time_label.setToolTip("")
+            return
+        down = run.down_time_ms
+        note = ("" if down is not None
+                else " Down time isn't recorded in this file, so none is assumed.")
+        down = down or 0.0
+        digits = 0 if single % 1000 == 0 and down % 1000 == 0 else 2
+        i, n = self._index, run.n_scans
+        now = (i + 1) * single + i * down
+        total = n * single + (n - 1) * down
+        self.time_label.setText(f"{clock(now, digits)}/{clock(total, digits)}")
+        self.time_label.setToolTip(
+            "Time at the end of this scan / end of the run, from the saved integration "
+            f"time ({single:g} ms) and down time ({down:g} ms) per scan.{note}")
 
     @staticmethod
     def _nav_button(icon, tip: str, slot, repeat: bool = False) -> QtWidgets.QToolButton:
@@ -181,6 +288,7 @@ class ViewPage(QtWidgets.QWidget):
             return False
         QtWidgets.QApplication.restoreOverrideCursor()
 
+        self._play(0)
         self._run = run
         self._stats = None
         self._follow_latest = follow
@@ -205,6 +313,8 @@ class ViewPage(QtWidgets.QWidget):
         parts = [f"{run.n_scans} scan{'s' if run.n_scans != 1 else ''}"]
         if run.integration_ms is not None:
             parts.append(f"{run.integration_ms:g} ms each")
+        if run.down_time_ms:
+            parts.append(f"{run.down_time_ms:g} ms down time")
         if run.mode is not None:
             parts.append(MODE_LABELS[run.mode])
         if run.acquired is not None:
@@ -225,6 +335,7 @@ class ViewPage(QtWidgets.QWidget):
         changed = index != self._index
         self._index = index
         self._set_nav_enabled()
+        self._update_time()
         if draw and changed:
             self._draw_scan()
 
@@ -234,7 +345,8 @@ class ViewPage(QtWidgets.QWidget):
         self.prev_btn.setEnabled(self._index > 0)
         self.next_btn.setEnabled(0 <= self._index < n - 1)
         self.last_btn.setEnabled(0 <= self._index < n - 1)
-        for w in (self.scan_spin, self.scan_slider):
+        for w in (self.scan_spin, self.scan_slider, self.rewind_btn, self.pause_btn,
+                  self.play_btn):
             w.setEnabled(n > 1)
 
     def _axis(self):
